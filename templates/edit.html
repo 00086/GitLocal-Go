@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>編輯 {{ .file_path }} - {{ .repo_name }}</title>
+    
+    <script>
+        const savedTheme = localStorage.getItem('gitlocal_theme') || 'light';
+        document.documentElement.setAttribute('data-bs-theme', savedTheme);
+    </script>
+
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link id="markdown-css" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-light.min.css">
+    
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/easymde/dist/easymde.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/theme/darcula.min.css">
+
+    <style>
+        html, body { height: 100vh; overflow: hidden !important; margin: 0; }
+        body.container { display: flex; flex-direction: column; max-width: 100%; padding-top: 1rem; padding-bottom: 1rem; }
+        nav, .header-controls { flex-shrink: 0; }
+        #edit-form { flex: 1; display: flex; flex-direction: column; min-height: 0; margin-bottom: 0; }
+        
+        #editor-container, #preview-container, #image-container { 
+            flex: 1; position: relative; margin-bottom: 1rem; 
+        }
+        
+        .engine-wrapper { 
+            position: absolute; top: 0; left: 0; right: 0; bottom: 0; 
+            display: flex; flex-direction: column; 
+            box-shadow: 0 .125rem .25rem rgba(0,0,0,.075); 
+            border-radius: 6px; overflow: hidden; 
+            border: 1px solid var(--bs-border-color); 
+            background: var(--bs-body-bg);
+        }
+        .engine-wrapper.d-none { display: none !important; }
+        
+        .cm-editor, .monaco-pane-wrapper { flex: 1; height: 100%; outline: none; }
+        .cm-scroller { overflow: auto !important; font-family: 'Consolas', 'Courier New', monospace !important; }
+        
+        #preview-pane { flex: 1; height: 100%; overflow-y: auto; border: 1px solid var(--bs-border-color); border-radius: 6px; padding: 30px; background-color: var(--bs-body-bg); color: var(--bs-body-color); }
+        .image-preview { max-width: 100%; max-height: 550px; border-radius: 6px; }
+        .bg-checkered { background-image: linear-gradient(45deg, #f0f0f0 25%, transparent 25%), linear-gradient(-45deg, #f0f0f0 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #f0f0f0 75%), linear-gradient(-45deg, transparent 75%, #f0f0f0 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px; }
+        [data-bs-theme="dark"] .bg-checkered { background-image: linear-gradient(45deg, #333 25%, transparent 25%), linear-gradient(-45deg, #333 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #333 75%), linear-gradient(-45deg, transparent 75%, #333 75%); }
+
+        /* ========================================== */
+        /* 🌟 EasyMDE 基礎版面 */
+        /* ========================================== */
+        #wrapper-easymde { display: flex; flex-direction: column; }
+        #wrapper-easymde .EasyMDEContainer { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+        #wrapper-easymde .editor-statusbar { display: none !important; }
+        #wrapper-easymde .CodeMirror-scroll { height: 100% !important; min-height: 100% !important; }
+        
+        #wrapper-easymde .editor-toolbar { flex: 0 0 auto !important; border: none; border-bottom: 1px solid var(--bs-border-color); background: var(--bs-tertiary-bg); }
+        #wrapper-easymde .editor-toolbar button { color: var(--bs-body-color) !important; }
+        #wrapper-easymde .editor-toolbar button:hover, #wrapper-easymde .editor-toolbar button.active { background: var(--bs-secondary-bg) !important; border-color: transparent !important; }
+        #wrapper-easymde .editor-toolbar i.separator { border-color: var(--bs-border-color) !important; border-right: none !important; margin: 0 4px; }
+        
+        #wrapper-easymde .CodeMirror { 
+            flex: 1 1 auto !important; height: 0 !important; min-height: 0 !important; border: none; 
+            font-family: 'Consolas', 'Courier New', monospace; font-size: 15px; 
+        }
+
+        /* ========================================== */
+        /* 🌟 深色主題統一修正 (背景與行數底色完全一致化) */
+        /* ========================================== */
+        [data-bs-theme="dark"] .engine-wrapper { border-color: #3e3e42 !important; background: #1e1e1e !important; }
+        
+        /* 1. CM6 統一深色背景與行數底色 */
+        [data-bs-theme="dark"] .cm-editor { background-color: #1e1e1e !important; }
+        [data-bs-theme="dark"] .cm-gutters { background-color: #1e1e1e !important; border-right: 1px solid #333 !important; color: #858585 !important; }
+
+        /* 2. EasyMDE 工具列暗黑化 */
+        [data-bs-theme="dark"] #wrapper-easymde .editor-toolbar { border-bottom: 1px solid #3e3e42 !important; background: #252526 !important; }
+        [data-bs-theme="dark"] #wrapper-easymde .editor-toolbar button { color: #d4d4d4 !important; }
+        [data-bs-theme="dark"] #wrapper-easymde .editor-toolbar button:hover, [data-bs-theme="dark"] #wrapper-easymde .editor-toolbar button.active { background: #3e3e42 !important; border-color: transparent !important; }
+        [data-bs-theme="dark"] #wrapper-easymde .editor-toolbar i.separator { border-color: #444 !important; }
+        
+        /* 3. 覆寫 Darcula 預設的 2b2b2b 背景，對齊 Monaco 的 1e1e1e */
+        [data-bs-theme="dark"] #wrapper-easymde .CodeMirror { background: #1e1e1e !important; }
+        [data-bs-theme="dark"] #wrapper-easymde .CodeMirror-gutters { background-color: #1e1e1e !important; border-right: 1px solid #333 !important; }
+        [data-bs-theme="dark"] #wrapper-easymde .CodeMirror-linenumber { color: #858585 !important; }
+    </style>
+</head>
+<body class="container">
+    <textarea id="raw-content-template" style="display:none;">{{ .content }}</textarea>
+
+    <nav aria-label="breadcrumb" class="mb-3">
+        <ol class="breadcrumb fs-5 mb-0">
+            <li class="breadcrumb-item"><a href="/" class="text-decoration-none">首頁</a></li>
+            <li class="breadcrumb-item"><a href="/repo/{{ .repo_name }}" class="text-decoration-none">{{ .repo_name }}</a></li>
+            <li class="breadcrumb-item active fw-bold text-body">{{ .file_path }}</li>
+        </ol>
+    </nav>
+
+    <div class="d-flex justify-content-between align-items-end mb-3 header-controls">
+        <h3 class="mb-0 fw-bold">📄 檔案編輯器</h3>
+        
+        <div class="d-flex gap-2">
+            <div id="engine-toggles" class="btn-group shadow-sm" role="group">
+                <input type="radio" class="btn-check" name="engineradio" id="btn-cm6" checked onclick="window.switchEngine('codemirror')">
+                <label class="btn btn-outline-secondary fw-bold" for="btn-cm6">⚡ CodeMirror 6</label>
+
+                <input type="radio" class="btn-check" name="engineradio" id="btn-monaco" onclick="window.switchEngine('monaco')">
+                <label class="btn btn-outline-secondary fw-bold" for="btn-monaco">👑 Monaco</label>
+                
+                <input type="radio" class="btn-check" name="engineradio" id="btn-easymde" onclick="window.switchEngine('easymde')">
+                <label class="btn btn-outline-secondary fw-bold" for="btn-easymde">📝 EasyMDE</label>
+            </div>
+
+            <div class="btn-group shadow-sm" id="font-controls">
+                <button type="button" class="btn btn-outline-secondary fw-bold px-3" onclick="window.changeFontSize(1)" title="放大字體">A+</button>
+                <button type="button" class="btn btn-outline-secondary fw-bold px-3" onclick="window.changeFontSize(-1)" title="縮小字體">A-</button>
+                <button type="button" class="btn btn-outline-secondary fw-bold px-3" onclick="window.changeFontSize(0)" title="重設字體">↺</button>
+            </div>
+            
+            <button type="button" class="btn btn-outline-secondary fw-bold px-3 shadow-sm" onclick="window.toggleTheme()" title="切換深淺模式">
+                <span id="theme-icon">🌙</span>
+            </button>
+
+            <div id="view-toggles" class="d-none btn-group shadow-sm" role="group">
+                <input type="radio" class="btn-check" name="btnradio" id="btn-edit" checked onchange="window.toggleView('edit')">
+                <label class="btn btn-outline-primary fw-bold" for="btn-edit">📝 編輯</label>
+
+                <input type="radio" class="btn-check" name="btnradio" id="btn-preview" onchange="window.toggleView('preview')">
+                <label class="btn btn-outline-primary fw-bold" for="btn-preview">👁️ 預覽</label>
+            </div>
+        </div>
+    </div>
+
+    <form action="/repo/{{ .repo_name }}/file/{{ .file_path }}" method="POST" id="edit-form" onsubmit="window.combineMessage(event)">
+        <div id="editor-container">
+            <div id="wrapper-codemirror" class="engine-wrapper"></div>
+            <div id="wrapper-monaco" class="engine-wrapper d-none"></div>
+            <div id="wrapper-easymde" class="engine-wrapper d-none">
+                <textarea id="easymde-textarea"></textarea>
+            </div>
+        </div>
+        
+        <div id="preview-container" class="d-none">
+            <div id="preview-pane" class="markdown-body shadow-sm"></div>
+        </div>
+
+        <div id="image-container" class="d-none text-center p-4 border rounded shadow-sm bg-checkered">
+            <img id="image-viewer" class="image-preview shadow" src="">
+            <div class="mt-3 text-muted fw-bold bg-white d-inline-block px-3 py-1 rounded border">這是圖片檔案，無法進行文字編輯。</div>
+        </div>
+
+        <div id="action-bar" class="card p-3 shadow-sm border-primary border-opacity-50">
+            <div class="row align-items-stretch g-2">
+                <div class="col-md-9 d-flex flex-column gap-2">
+                    <input type="text" id="commit_title" class="form-control border-primary border-opacity-25" placeholder="請輸入 Commit 標題 (預設: Update {{ .file_path }})" value="Update {{ .file_path }}" required>
+                    <textarea id="commit_body" class="form-control border-primary border-opacity-25" rows="1" placeholder="詳細備註 (可選)"></textarea>
+                </div>
+                <div class="col-md-3 d-flex">
+                    <button type="submit" class="btn btn-primary w-100 fw-bold shadow-sm">💾 儲存並 Commit</button>
+                </div>
+            </div>
+            <input type="hidden" name="content" id="hidden_content">
+            <input type="hidden" name="message" id="real_message">
+        </div>
+    </form>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/easymde/dist/easymde.min.js"></script>
+
+    <script type="module">
+        import { basicSetup } from 'https://esm.sh/codemirror';
+        import { EditorView } from 'https://esm.sh/@codemirror/view';
+        import { EditorState } from 'https://esm.sh/@codemirror/state';
+        import { oneDark } from 'https://esm.sh/@codemirror/theme-one-dark';
+        
+        import { python } from 'https://esm.sh/@codemirror/lang-python';
+        import { javascript } from 'https://esm.sh/@codemirror/lang-javascript';
+        import { html } from 'https://esm.sh/@codemirror/lang-html';
+        import { css } from 'https://esm.sh/@codemirror/lang-css';
+        import { markdown } from 'https://esm.sh/@codemirror/lang-markdown';
+        import { json } from 'https://esm.sh/@codemirror/lang-json';
+        import { cpp } from 'https://esm.sh/@codemirror/lang-cpp';
+        import { java } from 'https://esm.sh/@codemirror/lang-java';
+        import { php } from 'https://esm.sh/@codemirror/lang-php';
+        import { sql } from 'https://esm.sh/@codemirror/lang-sql';
+        import { rust } from 'https://esm.sh/@codemirror/lang-rust';
+
+        const filePath = "{{ .file_path }}";
+        const repoName = "{{ .repo_name }}";
+        const ext = filePath.split('.').pop().toLowerCase();
+        
+        const editorContainer = document.getElementById('editor-container');
+        const previewContainer = document.getElementById('preview-container');
+        const imageContainer = document.getElementById('image-container');
+        const actionBar = document.getElementById('action-bar');
+        const viewToggles = document.getElementById('view-toggles');
+        const fontControls = document.getElementById('font-controls');
+        const engineToggles = document.getElementById('engine-toggles');
+
+        let currentEngine = 'codemirror'; 
+        let currentCode = document.getElementById('raw-content-template').value;
+        let currentFontSize = 15;
+
+        let cm6View = null;
+        let monacoInstance = null;
+        let easyMdeInstance = null;
+
+        const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+        document.getElementById('theme-icon').innerText = isDark ? '🌞' : '🌙';
+        document.getElementById('markdown-css').href = `https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-${isDark ? 'dark' : 'light'}.min.css`;
+
+        // ==========================================
+        // 🌟 全域深淺色切換邏輯 (完美同步防錯亂)
+        // ==========================================
+        window.toggleTheme = function() {
+            const currentTheme = document.documentElement.getAttribute('data-bs-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            
+            document.documentElement.setAttribute('data-bs-theme', newTheme);
+            localStorage.setItem('gitlocal_theme', newTheme);
+            document.getElementById('theme-icon').innerText = newTheme === 'dark' ? '🌞' : '🌙';
+            document.getElementById('markdown-css').href = `https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-${newTheme}.min.css`;
+
+            if (monacoInstance) {
+                monaco.editor.setTheme(newTheme === 'dark' ? 'vs-dark' : 'vs');
+            }
+
+            // 💡 關鍵修復：無論 CM6 目前是否顯示，都必須銷毀。確保下次顯示時帶有正確主題！
+            if (cm6View) {
+                if (currentEngine === 'codemirror') {
+                    currentCode = cmViewGetCode(); // 先存檔
+                    cm6View.destroy();
+                    cm6View = null;
+                    initCodeMirror6(currentCode);
+                } else {
+                    cm6View.destroy();
+                    cm6View = null; // 在背景被銷毀，下次切換到它時會重新啟動
+                }
+            }
+
+            if (easyMdeInstance) {
+                easyMdeInstance.codemirror.setOption("theme", newTheme === 'dark' ? 'darcula' : 'default');
+                setTimeout(() => easyMdeInstance.codemirror.refresh(), 50);
+            }
+        };
+
+        const imageExtensions = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico'];
+        if (imageExtensions.includes(ext)) {
+            editorContainer.classList.add('d-none');
+            fontControls.classList.add('d-none');
+            engineToggles.classList.add('d-none');
+            actionBar.classList.add('d-none');
+            imageContainer.classList.remove('d-none');
+            document.getElementById('image-viewer').src = `/repo/${repoName}/raw/${filePath}`;
+        } else {
+            initCodeMirror6(currentCode);
+            if (ext === 'md' || ext === 'markdown') {
+                viewToggles.classList.remove('d-none');
+            }
+        }
+
+        // ==========================================
+        // 引擎 1：CodeMirror 6 
+        // ==========================================
+        function initCodeMirror6(codeText) {
+            const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+            const extensions = [basicSetup, EditorView.lineWrapping, getCM6Language(ext)];
+            if (isDark) extensions.push(oneDark);
+
+            cm6View = new EditorView({
+                state: EditorState.create({ doc: codeText, extensions: extensions }),
+                parent: document.getElementById('wrapper-codemirror')
+            });
+            applyFontSizeToDOM();
+        }
+
+        function setCM6Value(codeText) {
+            if (cm6View) cm6View.dispatch({ changes: { from: 0, to: cm6View.state.doc.length, insert: codeText } });
+        }
+
+        // ==========================================
+        // 引擎 2：Monaco 
+        // ==========================================
+        let isMonacoLoading = false;
+
+        function initMonaco(codeText) {
+            if (isMonacoLoading) return;
+            isMonacoLoading = true;
+
+            if (!window.require) {
+                const script = document.createElement('script');
+                script.src = 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js';
+                script.onload = () => loadMonacoCore(codeText);
+                document.head.appendChild(script);
+            } else {
+                loadMonacoCore(codeText);
+            }
+        }
+
+        function loadMonacoCore(codeText) {
+            require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs' } });
+            require(['vs/editor/editor.main'], function () {
+                const wrapper = document.getElementById('wrapper-monaco');
+                const innerPane = document.createElement('div');
+                innerPane.className = 'monaco-pane-wrapper';
+                wrapper.appendChild(innerPane);
+
+                const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+                monacoInstance = monaco.editor.create(innerPane, {
+                    value: currentCode,
+                    language: getMonacoLanguage(ext),
+                    theme: isDark ? 'vs-dark' : 'vs',
+                    fontSize: currentFontSize,
+                    fontFamily: "'Consolas', 'Courier New', monospace",
+                    automaticLayout: true,
+                    wordWrap: "on"
+                });
+                isMonacoLoading = false;
+            });
+        }
+
+        // ==========================================
+        // 引擎 3：EasyMDE
+        // ==========================================
+        function initEasyMDE(codeText) {
+            easyMdeInstance = new EasyMDE({
+                element: document.getElementById('easymde-textarea'), 
+                initialValue: codeText,
+                spellChecker: false,
+                status: false,
+            });
+            
+            // 💡 關鍵：啟動行數顯示與套用官方 Darcula 主題
+            const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+            easyMdeInstance.codemirror.setOption("lineNumbers", true);
+            easyMdeInstance.codemirror.setOption("theme", isDark ? "darcula" : "default");
+            
+            setTimeout(() => {
+                applyFontSizeToDOM(); 
+                if (easyMdeInstance) easyMdeInstance.codemirror.refresh();
+            }, 150);
+        }
+
+        // ==========================================
+        // 🌟 三引擎無縫切換邏輯 (解決切換後空白的 Bug)
+        // ==========================================
+        window.switchEngine = function(targetEngine) {
+            if (currentEngine === targetEngine) return;
+
+            currentCode = getActiveCode();
+
+            document.getElementById('wrapper-codemirror').classList.add('d-none');
+            document.getElementById('wrapper-monaco').classList.add('d-none');
+            document.getElementById('wrapper-easymde').classList.add('d-none');
+
+            document.getElementById(`wrapper-${targetEngine}`).classList.remove('d-none');
+            currentEngine = targetEngine;
+
+            if (targetEngine === 'codemirror') {
+                if (!cm6View) initCodeMirror6(currentCode);
+                else {
+                    setCM6Value(currentCode);
+                    cm6View.requestMeasure(); // 💡 強迫 CM6 在取消隱藏時重新計算版面
+                }
+            } else if (targetEngine === 'monaco') {
+                if (!monacoInstance) initMonaco(currentCode);
+                else {
+                    monacoInstance.setValue(currentCode);
+                    monacoInstance.layout(); // 💡 強迫 Monaco 在取消隱藏時重新計算版面
+                }
+            } else if (targetEngine === 'easymde') {
+                if (!easyMdeInstance) initEasyMDE(currentCode);
+                else {
+                    easyMdeInstance.value(currentCode);
+                    setTimeout(() => easyMdeInstance.codemirror.refresh(), 10);
+                }
+            }
+        };
+
+        function cmViewGetCode() { return cm6View ? cm6View.state.doc.toString() : ''; }
+        function getActiveCode() {
+            if (currentEngine === 'codemirror' && cm6View) return cmViewGetCode();
+            if (currentEngine === 'monaco' && monacoInstance) return monacoInstance.getValue();
+            if (currentEngine === 'easymde' && easyMdeInstance) return easyMdeInstance.value();
+            return currentCode;
+        }
+
+        // ==========================================
+        // 字體大小控制
+        // ==========================================
+        window.changeFontSize = function(delta) {
+            if (delta === 0) currentFontSize = 15;
+            else currentFontSize += delta * 2;
+            if (currentFontSize < 10) currentFontSize = 10;
+            if (currentFontSize > 36) currentFontSize = 36;
+
+            if (currentEngine === 'codemirror' || currentEngine === 'easymde') applyFontSizeToDOM();
+            else if (currentEngine === 'monaco' && monacoInstance) monacoInstance.updateOptions({ fontSize: currentFontSize });
+        };
+
+        function applyFontSizeToDOM() {
+            const cmElement = document.querySelector('.cm-editor');
+            if (cmElement) {
+                cmElement.style.fontSize = currentFontSize + 'px';
+                if (cm6View) cm6View.requestMeasure();
+            }
+            const cm5Element = document.querySelector('#wrapper-easymde .CodeMirror');
+            if (cm5Element && currentEngine === 'easymde') {
+                cm5Element.style.fontSize = currentFontSize + 'px';
+                if (easyMdeInstance) easyMdeInstance.codemirror.refresh();
+            }
+        }
+
+        function getCM6Language(extension) {
+            const mapping = { 
+                'py': python(), 'js': javascript(), 'json': json(), 
+                'html': html(), 'xml': html(), 'css': css(), 
+                'md': markdown(), 'markdown': markdown(),
+                'go': cpp(), 'mod': cpp(),
+                'c': cpp(), 'cpp': cpp(), 'h': cpp(), 'hpp': cpp(), 'cs': cpp(),
+                'java': java(), 'php': php(), 'sql': sql(), 'rs': rust(),
+                'asp': html(), 'aspx': html()
+            };
+            return mapping[extension] || [];
+        }
+
+        function getMonacoLanguage(extension) {
+            const mapping = { 
+                'py': 'python', 'js': 'javascript', 'json': 'json', 
+                'html': 'html', 'xml': 'xml', 'css': 'css', 
+                'md': 'markdown', 'markdown': 'markdown',
+                'go': 'go', 'mod': 'go',
+                'c': 'c', 'cpp': 'cpp', 'h': 'cpp', 'hpp': 'cpp',
+                'cs': 'csharp', 'asp': 'aspnet', 'aspx': 'aspnet',
+                'java': 'java', 'php': 'php', 'sql': 'sql', 'rs': 'rust',
+                'sh': 'shell', 'bash': 'shell', 'yaml': 'yaml', 'yml': 'yaml'
+            };
+            return mapping[extension] || 'plaintext';
+        }
+
+        window.toggleView = function(view) {
+            if (view === 'edit') {
+                editorContainer.classList.remove('d-none');
+                fontControls.classList.remove('d-none');
+                engineToggles.classList.remove('d-none');
+                previewContainer.classList.add('d-none');
+                actionBar.classList.remove('d-none');
+            } else if (view === 'preview') {
+                const markdownText = getActiveCode();
+                editorContainer.classList.add('d-none');
+                fontControls.classList.add('d-none');
+                engineToggles.classList.add('d-none');
+                previewContainer.classList.remove('d-none');
+                actionBar.classList.add('d-none');
+                document.getElementById('preview-pane').innerHTML = marked.parse(markdownText);
+            }
+        };
+        
+        window.combineMessage = function(event) {
+            document.getElementById('hidden_content').value = getActiveCode();
+            let title = document.getElementById('commit_title').value.trim() || `Update ${filePath}`;
+            let body = document.getElementById('commit_body').value.trim();
+            document.getElementById('real_message').value = body ? (title + "\n\n" + body) : title;
+        };
+    </script>
+</body>
+</html>
