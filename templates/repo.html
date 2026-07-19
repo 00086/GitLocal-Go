@@ -416,6 +416,38 @@
             </div>
         </div>
     </div>
+	
+	<div id="mergeModal" style="display:none; position:fixed; z-index:1080; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); justify-content:center; align-items:center; padding: 2vh 0;">
+        <div id="mergeModalContent" style="background:var(--bs-body-bg); color:var(--bs-body-color); width:95%; max-width:1400px; height:96vh; border-radius:0.5rem; display:flex; flex-direction:column; box-shadow:0 1rem 3rem rgba(0,0,0,0.3); overflow:hidden; transition: all 0.3s ease;">
+            <div style="padding:15px; border-bottom:1px solid var(--bs-border-color); display:flex; justify-content:space-between; align-items:center;">
+                <strong class="fs-5 text-warning fw-bold">⚔️ 視覺化合併與衝突解決 (Merge & Resolve)</strong>
+                <div>
+                    <button id="toggleMergeModalSizeBtn" class="btn btn-sm btn-outline-secondary me-2 fw-bold" onclick="toggleMergeModalSize()">⬜ 全螢幕</button>
+                    <button class="btn-close" onclick="closeMergeModal()" style="filter: var(--bs-btn-close-filter); vertical-align: middle;"></button>
+                </div>
+            </div>
+            
+            <div style="display:flex; flex:1; min-height:0;">
+                <div style="width: 260px; border-right: 1px solid var(--bs-border-color); display:flex; flex-direction:column; background:var(--bs-tertiary-bg);">
+                    <div class="p-2 border-bottom fw-bold text-secondary fs-6 text-center">📃 變更清單 (需逐一確認)</div>
+                    <ul class="list-group list-group-flush overflow-auto flex-grow-1" id="merge-file-list" style="border-radius:0;"></ul>
+                </div>
+                
+                <div style="flex:1; display:flex; flex-direction:column; min-width:0;">
+                    <div class="d-flex justify-content-between px-3 py-2 border-bottom" style="background:var(--bs-secondary-bg);">
+                        <span class="fw-bold text-danger">👈 左側：目前的程式碼 (Ours)</span>
+                        <span class="fw-bold text-success">👉 右側：合併進來的程式碼 (Theirs) <span class="badge bg-warning text-dark ms-2 fs-6 shadow-sm">✏️ 請直接在右側修改成最終版本</span></span>
+                    </div>
+                    <div id="monaco-diff-container" style="flex:1; min-height:0;"></div>
+                </div>
+            </div>
+            
+            <div style="padding:15px; border-top:1px solid var(--bs-border-color); display:flex; align-items:center; gap: 15px; background:var(--bs-tertiary-bg);">
+                <input type="text" id="merge-commit-msg" class="form-control fw-bold border-warning" placeholder="請輸入 Merge commit 說明...">
+                <button class="btn btn-warning fw-bold text-nowrap fs-5 px-4 shadow-sm" onclick="finalizeMerge()" id="finalize-merge-btn">🚀 儲存右側結果並合併</button>
+            </div>
+        </div>
+    </div>
 
 </body>
 </html>
@@ -464,39 +496,189 @@
         });
     }
 	
-	// 🌟 真正的合併分支 (Merge)
-    function mergeBranchPrompt() {
-        const availableBranches = branches.all.filter(b => b !== branches.current);
-        
-        if (availableBranches.length === 0) {
-            alert("目前沒有其他分支可以合併喔！");
-            return;
-        }
-        
-        const branchToMerge = prompt(`您目前位於 [${branches.current}] 分支。\n\n請輸入您想合併進來的分支名稱：\n[ ${availableBranches.join(' ,  ')} ]`);
-        
-        if (!branchToMerge) return; 
-        
-        if (!availableBranches.includes(branchToMerge)) {
-            alert("❌ 輸入的名稱錯誤，找不到該分支。");
-            return;
-        }
-        
-        if (confirm(`⚠️ 確認要將 [${branchToMerge}] 合併到目前的 [${branches.current}] 嗎？\n\n(系統將保留目前進度，並加入來源分支的檔案，最終產生一個 Y 字型的匯流 Commit)`)) {
-            const form = document.createElement('form');
-            form.method = 'POST';
-            form.action = `/repo/${repoName}/branch/merge`;
-            
-            const input = document.createElement('input');
-            input.type = 'hidden';
-            input.name = 'source_branch';
-            input.value = branchToMerge;
-            
-            form.appendChild(input);
-            document.body.appendChild(form);
-            form.submit();
-        }
-    }
+	// ==========================================
+	// 🌟 視覺化合併 (3-Way Merge) 前端驅動邏輯
+	// ==========================================
+	let mergeConflicts = [];
+	let currentMergeIndex = 0;
+	let diffEditorInstance = null;
+	let targetMergeBranch = "";
+	let isMonacoLoaded = false;
+
+	// 動態載入 Monaco 引擎 (因為 repo.html 原本沒有掛載它)
+	function loadMonacoDiffEditor(callback) {
+		if (isMonacoLoaded) { callback(); return; }
+		const script = document.createElement('script');
+		script.src = 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js';
+		script.onload = () => {
+			require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs' } });
+			isMonacoLoaded = true;
+			callback();
+		};
+		document.head.appendChild(script);
+	}
+
+	async function mergeBranchPrompt() {
+		const availableBranches = branches.all.filter(b => b !== branches.current);
+		if (availableBranches.length === 0) {
+			alert("目前沒有其他分支可以合併喔！");
+			return;
+		}
+		
+		const branchToMerge = prompt(`您目前位於 [${branches.current}] 分支。\n請輸入想合併進來的分支名稱：\n[ ${availableBranches.join(' ,  ')} ]`);
+		if (!branchToMerge || !availableBranches.includes(branchToMerge)) return;
+		
+		targetMergeBranch = branchToMerge;
+		
+		const formData = new FormData();
+		formData.append("source_branch", branchToMerge);
+		
+		try {
+			const res = await fetch(`/repo/${repoName}/branch/merge`, { method: 'POST', body: formData });
+			const data = await res.json();
+			
+			if (data.error) { alert("合併發生錯誤: " + data.error); return; }
+			
+			mergeConflicts = data.conflicts || [];
+			if (mergeConflicts.length === 0) {
+				alert("✅ 兩個分支的內容完全相同，無須合併！");
+				return;
+			}
+			
+			document.getElementById('merge-commit-msg').value = `Merge branch '${branchToMerge}' into ${branches.current}`;
+			openMergeModal();
+		} catch (e) {
+			alert("網路錯誤: " + e);
+		}
+	}
+
+	function openMergeModal() {
+		document.getElementById('mergeModal').style.display = 'flex';
+		renderMergeFileList();
+		
+		loadMonacoDiffEditor(() => {
+			require(['vs/editor/editor.main'], function () {
+				if (!diffEditorInstance) {
+					const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+					diffEditorInstance = monaco.editor.createDiffEditor(document.getElementById('monaco-diff-container'), {
+						theme: isDark ? 'vs-dark' : 'vs',
+						automaticLayout: true,
+						originalEditable: false, // 鎖死左側 (Ours)
+						renderSideBySide: true,  // 雙視窗並排
+						ignoreTrimWhitespace: false
+					});
+				}
+				loadMergeConflict(0); // 載入第一筆檔案
+			});
+		});
+	}
+
+	function renderMergeFileList() {
+		const list = document.getElementById('merge-file-list');
+		list.innerHTML = '';
+		mergeConflicts.forEach((c, idx) => {
+			const isActive = idx === currentMergeIndex ? 'bg-primary text-white fw-bold' : 'text-body';
+			list.innerHTML += `<button class="list-group-item list-group-item-action ${isActive} text-truncate py-2" onclick="saveCurrentAndLoad(${idx})" style="border-radius:0;">📄 ${c.path}</button>`;
+		});
+	}
+
+	function saveCurrentAndLoad(newIdx) {
+		if (diffEditorInstance) {
+			// 切換檔案前，將右側使用者修改的最終版本存回記憶體
+			mergeConflicts[currentMergeIndex].theirs = diffEditorInstance.getModifiedEditor().getValue();
+		}
+		currentMergeIndex = newIdx;
+		loadMergeConflict(newIdx);
+		renderMergeFileList();
+	}
+
+	function loadMergeConflict(idx) {
+		if (!diffEditorInstance) return;
+		const c = mergeConflicts[idx];
+		const ext = c.path.split('.').pop().toLowerCase();
+		
+		// 呼叫您現有的 getMonacoLanguage 輔助函數
+		const lang = typeof getMonacoLanguage === "function" ? getMonacoLanguage(ext) : "plaintext"; 
+		
+		const originalModel = monaco.editor.createModel(c.ours, lang);
+		const modifiedModel = monaco.editor.createModel(c.theirs, lang);
+		
+		diffEditorInstance.setModel({ original: originalModel, modified: modifiedModel });
+	}
+
+	async function finalizeMerge() {
+		const btn = document.getElementById('finalize-merge-btn');
+		btn.disabled = true;
+		btn.innerText = "⏳ 儲存並合併中...";
+
+		// 儲存當前畫面上正在編輯的最後一個檔案
+		if (diffEditorInstance) {
+			mergeConflicts[currentMergeIndex].theirs = diffEditorInstance.getModifiedEditor().getValue();
+		}
+		
+		const resolvedFiles = {};
+		mergeConflicts.forEach(c => { resolvedFiles[c.path] = c.theirs; }); // 將右側內容作為最終版本
+		
+		const msg = document.getElementById('merge-commit-msg').value;
+		
+		const payload = {
+			source_branch: targetMergeBranch,
+			message: msg,
+			resolved_files: resolvedFiles
+		};
+		
+		try {
+			const res = await fetch(`/repo/${repoName}/branch/merge/resolve`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(payload)
+			});
+			
+			if (res.ok) {
+				alert("🎉 合併成功！Git 樹狀圖已經為您畫出完美的 Y 字型路線！");
+				location.reload();
+			} else {
+				alert("❌ 合併失敗: " + await res.text());
+				btn.disabled = false;
+				btn.innerText = "🚀 儲存右側結果並合併";
+			}
+		} catch (err) {
+			alert("網路錯誤: " + err);
+		}
+	}
+
+	function closeMergeModal() { 
+		document.getElementById('mergeModal').style.display = 'none'; 
+	}
+
+	// 🌟 新增：合併視窗全螢幕切換邏輯
+	function toggleMergeModalSize() {
+		const modalContent = document.getElementById('mergeModalContent');
+		const btn = document.getElementById('toggleMergeModalSizeBtn');
+		
+		if (modalContent.style.width === "100%") {
+			// 恢復原本大小
+			modalContent.style.width = "95%";
+			modalContent.style.maxWidth = "1400px";
+			modalContent.style.height = "96vh";
+			modalContent.style.borderRadius = "0.5rem";
+			btn.innerHTML = "⬜ 全螢幕";
+		} else {
+			// 放大全螢幕
+			modalContent.style.width = "100%";
+			modalContent.style.maxWidth = "none";
+			modalContent.style.height = "100%";
+			modalContent.style.borderRadius = "0"; 
+			btn.innerHTML = "🔲 復原";
+		}
+
+		// 🌟 關鍵：等待 CSS 動畫 (0.3s) 結束後，強制 Monaco Editor 重新計算版面，防止跑版
+		setTimeout(() => {
+			if (diffEditorInstance) {
+				diffEditorInstance.layout();
+			}
+		}, 310);
+	}
 
     // 🌟 切換分支 (透過建立隱藏表單發送 POST 請求)
     function switchBranch(branchName) {
