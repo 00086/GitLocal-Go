@@ -857,4 +857,101 @@ func EditRelease(repoName, oldTagName, newTagName, message string, assets []Uplo
 	return nil
 }
 
+// ==========================================
+// 🌟 視覺化合併 (3-Way Merge) 核心引擎
+// ==========================================
+
+type MergeConflict struct {
+	Path   string `json:"path"`
+	Ours   string `json:"ours"`
+	Theirs string `json:"theirs"`
+}
+
+// 1. 啟動合併：掃描並回傳兩條分支有差異的檔案
+func InitiateMerge(repoName, sourceBranch string) ([]MergeConflict, error) {
+	gitLock.Lock()
+	defer gitLock.Unlock()
+
+	repo, err := git.PlainOpen(filepath.Join(ReposDir, repoName))
+	if err != nil { return nil, err }
+
+	headRef, err := repo.Head()
+	if err != nil { return nil, err }
+
+	sourceRef, err := repo.Reference(plumbing.NewBranchReferenceName(sourceBranch), true)
+	if err != nil { return nil, err }
+
+	oursCommit, _ := repo.CommitObject(headRef.Hash())
+	theirsCommit, _ := repo.CommitObject(sourceRef.Hash())
+	oursTree, _ := oursCommit.Tree()
+	theirsTree, _ := theirsCommit.Tree()
+
+	// 比對兩棵樹的差異
+	changes, err := oursTree.Diff(theirsTree)
+	if err != nil { return nil, err }
+
+	var conflicts []MergeConflict
+	for _, ch := range changes {
+		conflict := MergeConflict{}
+		
+		if ch.From.Name == "" && ch.To.Name != "" { 
+			// 來源分支新增的檔案
+			conflict.Path = ch.To.Name
+			fTheirs, _ := theirsTree.File(ch.To.Name)
+			conflict.Theirs, _ = fTheirs.Contents()
+		} else if ch.From.Name != "" && ch.To.Name == "" { 
+			// 來源分支刪除的檔案
+			conflict.Path = ch.From.Name
+			fOurs, _ := oursTree.File(ch.From.Name)
+			conflict.Ours, _ = fOurs.Contents()
+		} else { 
+			// 雙方都有修改的檔案
+			conflict.Path = ch.To.Name
+			fOurs, _ := oursTree.File(ch.From.Name)
+			conflict.Ours, _ = fOurs.Contents()
+			
+			fTheirs, _ := theirsTree.File(ch.To.Name)
+			conflict.Theirs, _ = fTheirs.Contents()
+		}
+		conflicts = append(conflicts, conflict)
+	}
+	return conflicts, nil
+}
+
+// 2. 封裝合併：寫入使用者在網頁上決定的最終結果，並產生雙親節點 (Merge Commit)
+func FinalizeMerge(repoName, sourceBranch, message string, resolvedFiles map[string]string) error {
+	gitLock.Lock()
+	defer gitLock.Unlock()
+
+	path := filepath.Join(ReposDir, repoName)
+	repo, err := git.PlainOpen(path)
+	if err != nil { return err }
+
+	wt, err := repo.Worktree()
+	if err != nil { return err }
+
+	headRef, _ := repo.Head()
+	sourceRef, _ := repo.Reference(plumbing.NewBranchReferenceName(sourceBranch), true)
+
+	// 覆寫為使用者在前端決定好的最終程式碼
+	for fPath, content := range resolvedFiles {
+		fullPath := filepath.Join(path, fPath)
+		if content == "" {
+			os.Remove(fullPath)
+			wt.Remove(fPath)
+		} else {
+			os.MkdirAll(filepath.Dir(fullPath), 0755)
+			os.WriteFile(fullPath, []byte(content), 0644)
+			wt.Add(fPath)
+		}
+	}
+
+	// 🌟 關鍵魔法：賦予這個 Commit 兩個父親，讓 Git 樹狀圖畫出 Y 字型合併線！
+	_, err = wt.Commit(message, &git.CommitOptions{
+		Author:  &object.Signature{Name: "Web User", Email: "web@local.git", When: time.Now()},
+		Parents: []plumbing.Hash{headRef.Hash(), sourceRef.Hash()},
+	})
+	return err
+}
+
 

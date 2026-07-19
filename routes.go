@@ -470,5 +470,47 @@ func registerWebUI(r *gin.Engine) {
 		}
 		c.Redirect(http.StatusFound, "/repo/"+repoName)
 	})	
+	
+	// 🌟 ==========================================
+	// 🌟 視覺化合併 (3-Way Merge) 專屬 API
+	// 🌟 ==========================================
+	
+	type ResolveMergeRequest struct {
+		SourceBranch  string            `json:"source_branch"`
+		Message       string            `json:"message"`
+		ResolvedFiles map[string]string `json:"resolved_files"`
+	}
+
+	// 1. 請求合併 (回傳差異檔案清單給前端 Monaco 渲染)
+	r.POST("/repo/:repo_name/branch/merge", func(c *gin.Context) {
+		repoName := c.Param("repo_name")
+		sourceBranch := c.PostForm("source_branch")
+
+		conflicts, err := InitiateMerge(repoName, sourceBranch)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		
+		c.JSON(http.StatusOK, gin.H{"conflicts": conflicts})
+	})
+
+	// 2. 接收前端解完衝突的最終檔案，執行 Commit
+	r.POST("/repo/:repo_name/branch/merge/resolve", func(c *gin.Context) {
+		repoName := c.Param("repo_name")
+		var req ResolveMergeRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.String(http.StatusBadRequest, "參數解析失敗: "+err.Error())
+			return
+		}
+
+		err := FinalizeMerge(repoName, req.SourceBranch, req.Message, req.ResolvedFiles)
+		if err != nil {
+			c.String(http.StatusInternalServerError, "合併寫入失敗: "+err.Error())
+			return
+		}
+
+		c.String(http.StatusOK, "Success")
+	})
 	// TODO: 陸續補齊其他 API (download, branch/create 等)
 }
