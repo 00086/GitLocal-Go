@@ -512,5 +512,29 @@ func registerWebUI(r *gin.Engine) {
 
 		c.String(http.StatusOK, "Success")
 	})
+	
+	// 🌟 ==========================================
+	// 🌟 非同步 Commit 分頁資料 API
+	// 🌟 ==========================================
+	r.GET("/api/repo/:repo_name/commits", func(c *gin.Context) {
+		repoName := c.Param("repo_name")
+		
+		// 預設抓取第 1 頁，每頁 25 筆
+		pageStr := c.DefaultQuery("page", "1")
+		limitStr := c.DefaultQuery("limit", "25")
+		
+		page := 1
+		limit := 25
+		fmt.Sscanf(pageStr, "%d", &page)
+		fmt.Sscanf(limitStr, "%d", &limit)
+
+		resp, err := GetPaginatedCommits(repoName, page, limit)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		
+		c.JSON(http.StatusOK, resp)
+	})
 	// TODO: 陸續補齊其他 API (download, branch/create 等)
 }

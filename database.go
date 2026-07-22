@@ -211,70 +211,114 @@ func GetRepoDetails(repoName string) *RepoDetails {
 		return nil
 	})
 
-	fileLastCommit := make(map[string]*object.Commit)
+	// 🌟 1. 全分支強制掃描 GraphCommits (確保樹狀圖資料完整)
+	visitedCommits := make(map[string]bool)
+	details.GraphCommits = []CommitData{}
 
+	var startingHashes []plumbing.Hash
 	if headRef != nil {
-		logIter, err := repo.Log(&git.LogOptions{From: headRef.Hash()})
-		if err == nil {
-			logIter.ForEach(func(c *object.Commit) error {
-				parents := []string{}
-				for _, p := range c.ParentHashes {
-					parents = append(parents, p.String())
-				}
-				var changedFiles []string
-				stats, err := c.Stats()
-				if err == nil {
-					for _, stat := range stats {
-						changedFiles = append(changedFiles, stat.Name)
-						if _, exists := fileLastCommit[stat.Name]; !exists {
-							fileLastCommit[stat.Name] = c
-						}
-					}
-				}
-				commitData := CommitData{
-					Hexsha:  c.Hash.String(),
-					Message: strings.TrimSpace(c.Message),
-					Time:    c.Author.When.Format("2006-01-02 15:04:05"),
-					Parents: parents,
-					Files:   changedFiles,
-				}
-				details.Commits = append(details.Commits, commitData)
-				return nil
-			})
-		}
+		startingHashes = append(startingHashes, headRef.Hash())
 	}
-
-	graphIter, err := repo.Log(&git.LogOptions{All: true})
-	if err == nil {
-		graphIter.ForEach(func(c *object.Commit) error {
-			parents := []string{}
-			for _, p := range c.ParentHashes {
-				parents = append(parents, p.String())
-			}
-			commitData := CommitData{
-				Hexsha:  c.Hash.String(),
-				Message: strings.TrimSpace(c.Message),
-				Time:    c.Author.When.Format("2006-01-02 15:04:05"),
-				Parents: parents,
-			}
-			details.GraphCommits = append(details.GraphCommits, commitData)
+	if branchIter, err := repo.Branches(); err == nil {
+		branchIter.ForEach(func(ref *plumbing.Reference) error {
+			startingHashes = append(startingHashes, ref.Hash())
 			return nil
 		})
 	}
 
+	for _, startHash := range startingHashes {
+		gIter, err := repo.Log(&git.LogOptions{From: startHash})
+		if err != nil { continue }
+		gIter.ForEach(func(c *object.Commit) error {
+			sha := c.Hash.String()
+			if visitedCommits[sha] { return nil }
+			visitedCommits[sha] = true
+
+			parents := []string{}
+			for _, p := range c.ParentHashes {
+				parents = append(parents, p.String())
+			}
+			details.GraphCommits = append(details.GraphCommits, CommitData{
+				Hexsha:  sha,
+				Message: strings.TrimSpace(c.Message),
+				Time:    c.Author.When.Format("2006-01-02 15:04:05"),
+				Parents: parents,
+			})
+			return nil
+		})
+	}
+
+	// 🌟 2. 極速且精準的檔案歷史對應 (使用 Tree.Diff + 提早結束機制，絕不卡頓)
+	fileLastCommit := make(map[string]*object.Commit)
+
 	if headRef != nil {
 		headCommit, err := repo.CommitObject(headRef.Hash())
 		if err == nil {
-			tree, err := headCommit.Tree()
-			if err == nil {
-				tree.Files().ForEach(func(f *object.File) error {
+			tree, errTree := headCommit.Tree()
+			if errTree == nil {
+				// 建立當前專案所有檔案的「待查清單」
+				remainingFiles := make(map[string]bool)
+				_ = tree.Files().ForEach(func(f *object.File) error {
+					remainingFiles[f.Name] = true
+					return nil
+				})
+
+				// 往回追蹤 Log
+				logIter, errLog := repo.Log(&git.LogOptions{From: headRef.Hash()})
+				if errLog == nil {
+					_ = logIter.ForEach(func(c *object.Commit) error {
+						// 💡 關鍵極速魔法：所有檔案都找到最後修改者了，立刻終止，絕不浪費時間！
+						if len(remainingFiles) == 0 {
+							return io.EOF
+						}
+
+						cTree, errCTree := c.Tree()
+						if errCTree != nil { return nil }
+
+						if c.NumParents() == 0 {
+							// 創世 Commit：裡面的所有檔案都算這顆 Commit 產生的
+							_ = cTree.Files().ForEach(func(f *object.File) error {
+								if remainingFiles[f.Name] {
+									fileLastCommit[f.Name] = c
+									delete(remainingFiles, f.Name)
+								}
+								return nil
+							})
+						} else {
+							// 非創世 Commit：只做極速的 Tree 節點 Diff (不計算內文 Patch)
+							parentCommit, errP := c.Parent(0)
+							if errP == nil {
+								pTree, errPTree := parentCommit.Tree()
+								if errPTree == nil {
+									changes, errDiff := pTree.Diff(cTree)
+									if errDiff == nil {
+										for _, ch := range changes {
+											fPath := ch.To.Name
+											if fPath == "" { fPath = ch.From.Name }
+											if remainingFiles[fPath] {
+												fileLastCommit[fPath] = c
+												delete(remainingFiles, fPath) // 找到了就剔除
+											}
+										}
+									}
+								}
+							}
+						}
+						return nil
+					})
+				}
+
+				// 寫入檔案列表
+				_ = tree.Files().ForEach(func(f *object.File) error {
 					commitToUse := headCommit
-					if lastC, ok := fileLastCommit[f.Name]; ok { commitToUse = lastC }
+					if lastC, ok := fileLastCommit[f.Name]; ok {
+						commitToUse = lastC
+					}
 					details.Files = append(details.Files, FileData{
 						Path:        f.Name,
 						DisplayName: filepath.Base(f.Name),
 						Message:     strings.TrimSpace(commitToUse.Message),
-						Time:        formatRelativeTime(commitToUse.Author.When), 
+						Time:        formatRelativeTime(commitToUse.Author.When),
 						Hexsha:      commitToUse.Hash.String(),
 					})
 					return nil
@@ -282,6 +326,7 @@ func GetRepoDetails(repoName string) *RepoDetails {
 			}
 		}
 	}
+
 	return details
 }
 
@@ -954,4 +999,69 @@ func FinalizeMerge(repoName, sourceBranch, message string, resolvedFiles map[str
 	return err
 }
 
+// ==========================================
+// 🌟 高效能非同步分頁 API 專用結構
+// ==========================================
+
+type CommitPageResponse struct {
+	TotalCount int          `json:"total_count"`
+	TotalPages int          `json:"total_pages"`
+	Page       int          `json:"page"`
+	Commits    []CommitData `json:"commits"`
+}
+
+func GetPaginatedCommits(repoName string, page int, limit int) (*CommitPageResponse, error) {
+	gitLock.Lock()
+	defer gitLock.Unlock()
+
+	path := filepath.Join(ReposDir, repoName)
+	repo, err := git.PlainOpen(path)
+	if err != nil { return nil, err }
+
+	headRef, err := repo.Head()
+	if err != nil { return nil, err }
+
+	logIter, err := repo.Log(&git.LogOptions{From: headRef.Hash()})
+	if err != nil { return nil, err }
+
+	offset := (page - 1) * limit
+	total := 0
+	var commits []CommitData
+
+	// 極速遍歷：只算總數，遇到落入區間的才做耗時的 Stats() 處理
+	err = logIter.ForEach(func(c *object.Commit) error {
+		if total >= offset && total < offset+limit {
+			parents := []string{}
+			for _, p := range c.ParentHashes { parents = append(parents, p.String()) }
+			
+			var changedFiles []string
+			// 🌟 只有這 25 筆會執行耗時的 c.Stats()
+			stats, errStat := c.Stats()
+			if errStat == nil {
+				for _, stat := range stats { changedFiles = append(changedFiles, stat.Name) }
+			}
+
+			commitData := CommitData{
+				Hexsha:  c.Hash.String(),
+				Message: strings.TrimSpace(c.Message),
+				Time:    c.Author.When.Format("2006-01-02 15:04:05"),
+				Parents: parents,
+				Files:   changedFiles,
+			}
+			commits = append(commits, commitData)
+		}
+		total++
+		return nil
+	})
+
+	totalPages := total / limit
+	if total%limit != 0 { totalPages++ }
+
+	return &CommitPageResponse{
+		TotalCount: total,
+		TotalPages: totalPages,
+		Page:       page,
+		Commits:    commits,
+	}, nil
+}
 

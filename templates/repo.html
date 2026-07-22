@@ -225,7 +225,7 @@
                     </div>
                 </div>
                 
-                <div id="history-container" class="shadow-sm border rounded flex-grow-1 overflow-auto mb-2">
+                <div id="history-container" class="shadow-sm border rounded flex-grow-1 overflow-auto mb-2 d-flex flex-column">
                     <table class="table table-hover table-sm mb-0">
                         <thead>
                             <tr>
@@ -235,8 +235,26 @@
                                 <th style="width: 20%;">時間</th>
                             </tr>
                         </thead>
-                        <tbody id="commit-table-body"></tbody>
+                        <tbody id="commit-table-body">
+                            <!-- 預設顯示載入中動畫 -->
+                            <tr>
+                                <td colspan="4" class="text-center py-5 text-muted">
+                                    <div class="spinner-border text-primary mb-2" role="status"></div>
+                                    <div class="fw-bold">時光機啟動中，載入歷史紀錄...</div>
+                                </td>
+                            </tr>
+                        </tbody>
                     </table>
+                    
+                    <!-- 🌟 動態分頁按鈕區塊 -->
+                    <div id="pagination-container" class="p-3 bg-light border-top d-flex justify-content-between align-items-center mt-auto d-none">
+                        <small class="text-muted fw-bold" id="page-info-text">顯示第 1 頁 / 共 ? 頁</small>
+                        <nav aria-label="Commit navigation">
+                            <ul class="pagination pagination-sm mb-0" id="pagination-buttons">
+                                <!-- 按鈕由 JS 動態生成 -->
+                            </ul>
+                        </nav>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1088,31 +1106,23 @@
 	document.addEventListener('DOMContentLoaded', () => { 
 		const currentTheme = document.documentElement.getAttribute('data-bs-theme');
 		updateThemeIcon(currentTheme);
-		// 🌟 網頁載入時同步套用正確的 Markdown 黑白樣式
 		document.getElementById('markdown-css').href = `https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-${currentTheme === 'dark' ? 'dark' : 'light'}.min.css`;
 
+		// 🌟 網頁啟動時，只在全域執行一次初始化渲染
 		renderFileTree(); 
-		renderCommits();
+		fetchAndRenderCommits(1); // 非同步載入 Commit 歷史分頁
 		renderBranches(); 
 		renderReleases(); 
 
-		// 🌟 新增：如果網址帶有 #releases，自動切換到 Releases 頁籤
+		// 處理網址頁籤 hash 判斷
 		if (window.location.hash === '#releases') {
 			const triggerEl = document.querySelector('#releases-tab');
 			if (triggerEl) {
 				const tab = new bootstrap.Tab(triggerEl);
 				tab.show();
-				// 清除 hash 避免干擾後續操作
 				history.replaceState(null, null, ' '); 
 			}
 		}
-	});
-
-	document.addEventListener('DOMContentLoaded', () => { 
-		renderFileTree(); 
-		renderCommits();
-		renderBranches(); // 🌟 啟動時渲染分支選單
-		renderReleases(); // 🌟 啟動時渲染發布清單
 	});
 
 	document.getElementById('new-file-form').addEventListener('submit', function(e) {
@@ -1200,116 +1210,138 @@
 		const graphContainer = document.getElementById("gitgraph");
 		graphContainer.innerHTML = ""; 
 
+		if (!graph_commits || graph_commits.length === 0) return;
+
+		// 🌟 1. 建立畫筆：取消預設主題色票，交由我們手動精準死鎖顏色！
 		const gitgraph = GitgraphJS.createGitgraph(graphContainer, {
 			orientation: "vertical", 
-			template: "metro" 
+			template: GitgraphJS.templateExtend("metro", {
+				commit: { message: { displayAuthor: false, displayHash: true } }
+			})
 		});
 
-        // ==========================================
-        // 🌟 第一階段：追蹤血統，分配所屬的分支路線 (由新到舊)
-        // ==========================================
-        const commitToLine = {}; // 紀錄：Commit SHA -> 該畫在哪條線 (字串)
+        // 🌟 2. 建立快速查詢字典，並按時間由舊到新排序 (Oldest -> Newest)
+        const commitMap = {};
+        graph_commits.forEach(c => commitMap[c.hexsha] = c);
+        const sortedCommits = [...graph_commits].sort((a, b) => new Date(a.time) - new Date(b.time));
+
+        // 🌟 3. 確定性血統歸屬 (確定每一顆 Commit 屬於哪個分支)
+        const commitToBranch = {};
         
-        graph_commits.forEach(c => {
-            const sha = c.hexsha;
-            let myLine = commitToLine[sha];
-
-            // 1. 如果它是某個分支的最前端 (Tip)，賦予它該分支的名稱
-            if (!myLine && branches.tips && branches.tips[sha]) {
-                const tags = branches.tips[sha];
-                if (tags.includes(branches.current)) myLine = branches.current;
-                else if (tags.includes('master')) myLine = 'master';
-                else if (tags.includes('main')) myLine = 'main';
-                else myLine = tags[0];
-                commitToLine[sha] = myLine;
+        // 👑 霸王條款：優先讓 master / main 沿著第一父節點(P1) 霸佔主幹
+        ['master', 'main'].forEach(mainName => {
+            let tipSha = null;
+            if (branches && branches.tips) {
+                Object.keys(branches.tips).forEach(sha => {
+                    if ((branches.tips[sha] || []).includes(mainName)) tipSha = sha;
+                });
             }
-
-            // 2. 如果還是沒有名字 (孤立節點)，用它的 SHA 產生一個臨時線
-            if (!myLine) {
-                myLine = "branch_" + sha.substring(0, 7);
-                commitToLine[sha] = myLine;
-            }
-
-            // 3. 把這條路線的血統傳承給它的父親們
-            const parents = c.parents || [];
-            if (parents.length > 0) {
-                const p1 = parents[0]; // 第一父節點 (主線延續)
-                // 如果父親還沒有被分配路線，就繼承孩子的路線
-                if (!commitToLine[p1]) commitToLine[p1] = myLine; 
-                
-                if (parents.length > 1) {
-                    const p2 = parents[1]; // 第二父節點 (被合併的線)
-                    // 被合併進來的線絕對是一條不同的分支，給它一個新路線名
-                    if (!commitToLine[p2]) commitToLine[p2] = "branch_" + p2.substring(0, 7);
+            if (tipSha) {
+                let curr = tipSha;
+                while (curr && commitMap[curr]) {
+                    if (!commitToBranch[curr]) commitToBranch[curr] = mainName;
+                    const parents = commitMap[curr].parents || [];
+                    curr = parents.length > 0 ? parents[0] : null; // 順著 P1 往下走
                 }
             }
         });
 
-        // ==========================================
-        // 🌟 第二階段：實際繪製圖表 (由舊到新)
-        // ==========================================
-		const sortedCommits = [...graph_commits].reverse();
-		const lineToGitGraphBranch = {}; // 紀錄：路線名稱 -> GitGraph 實體物件
-
-		sortedCommits.forEach(item => {
-            const sha = item.hexsha || "";
-            const shortSha = sha.substring(0, 7);
-            const parents = item.parents || [];
-            
-            const myLine = commitToLine[sha];
-            let targetBranch = lineToGitGraphBranch[myLine];
-
-            // 如果 GitGraph 還沒有建立這條線，代表這是一個新的起點或分岔點
-            if (!targetBranch) {
-                if (parents.length === 0) {
-                    // 創世節點
-                    targetBranch = gitgraph.branch(myLine);
-                } else {
-                    // Y 型分岔點：從父親的實體物件上，呼叫 branch 劈出新線條
-                    const p1 = parents[0];
-                    const p1Line = commitToLine[p1];
-                    const p1Branch = lineToGitGraphBranch[p1Line];
-                    
-                    if (p1Branch) {
-                        targetBranch = p1Branch.branch(myLine);
-                    } else {
-                        targetBranch = gitgraph.branch(myLine); // 防呆
+        // 處理其他分支 (例如 UX_for_list_speed)
+        if (branches && branches.tips) {
+            Object.keys(branches.tips).forEach(sha => {
+                const tags = branches.tips[sha] || [];
+                tags.forEach(bName => {
+                    if (bName === 'master' || bName === 'main') return;
+                    let curr = sha;
+                    while (curr && commitMap[curr]) {
+                        if (!commitToBranch[curr]) {
+                            commitToBranch[curr] = bName;
+                            const parents = commitMap[curr].parents || [];
+                            curr = parents.length > 0 ? parents[0] : null;
+                        } else {
+                            break; // 撞到 master 就停止
+                        }
                     }
+                });
+            });
+        }
+
+        // 掃蕩未歸屬的 Commit，預設歸主線
+        sortedCommits.forEach(c => {
+            if (!commitToBranch[c.hexsha]) commitToBranch[c.hexsha] = "master";
+        });
+
+        // 🌟 4. 開始指令式繪圖 (從舊到新)
+        const branchObjs = {};
+        const palette = ["#0d6efd", "#198754", "#ffc107", "#dc3545", "#0dcaf0"]; // 支線專用顏色 (藍, 綠, 黃, 紅, 淺藍)
+        let colorIdx = 0;
+
+        // 👑 死鎖灰色：強制建立 master 畫筆，並硬寫 CSS 顏色為灰色 `#8b9298`！
+        const mainBranchName = branches.all.includes("master") ? "master" : (branches.all.includes("main") ? "main" : "master");
+        branchObjs[mainBranchName] = gitgraph.branch({
+            name: mainBranchName,
+            style: { color: "#8b9298", label: { strokeColor: "#8b9298" } } // 🌟 灰色主幹死鎖！
+        });
+
+		sortedCommits.forEach(c => {
+            const sha = c.hexsha;
+            const shortSha = sha.substring(0, 7);
+            const parents = c.parents || [];
+            const bName = commitToBranch[sha];
+
+            // 取得或建立畫筆
+            let bObj = branchObjs[bName];
+            if (!bObj) {
+                let parentBranchObj = branchObjs[mainBranchName];
+                if (parents.length > 0) {
+                    const p1Branch = commitToBranch[parents[0]];
+                    if (branchObjs[p1Branch]) parentBranchObj = branchObjs[p1Branch];
                 }
-                lineToGitGraphBranch[myLine] = targetBranch;
+                
+                const branchColor = palette[colorIdx % palette.length];
+                colorIdx++;
+
+                // 🌟 分支出來的畫筆：死鎖藍色/繽紛色！
+                bObj = parentBranchObj.branch({
+                    name: bName,
+                    style: { color: branchColor, label: { strokeColor: branchColor } }
+                });
+                branchObjs[bName] = bObj;
             }
 
-            let commitTags = branches.tips ? (branches.tips[sha] || []) : [];
+            const commitTags = (branches.tips && branches.tips[sha]) ? branches.tips[sha] : [];
+            const msgTitle = (c.message || "無說明").split('\n')[0];
 
-            // 處理雙親合併 (Merge)
+            // 處理 Merge Commit (雙親合併)
             if (parents.length > 1) {
-                const p2 = parents[1];
-                const p2Line = commitToLine[p2];
-                const p2Branch = lineToGitGraphBranch[p2Line];
-                
-                if (p2Branch && p2Branch !== targetBranch) {
-                    targetBranch.merge({
-                        branch: p2Branch,
+                const p2Sha = parents[1];
+                const p2BranchName = commitToBranch[p2Sha];
+                let p2Obj = branchObjs[p2BranchName];
+
+                if (p2Obj && p2Obj !== bObj) {
+                    bObj.merge({
+                        branch: p2Obj,
+                        fastForward: false, // 強制畫出匯入曲線
                         commitOptions: {
                             hash: shortSha,
-                            subject: item.message || "無說明",
-                            author: item.time || "",
+                            subject: msgTitle,
+                            author: c.time || "",
                             tags: commitTags,
                             onMessageClick: () => openCommitModal(sha)
                         }
                     });
-                    return; // 畫完合併點跳出
+                    return;
                 }
             }
 
-            // 一般單線推進
-			targetBranch.commit({
-				hash: shortSha,
-				subject: item.message || "無說明",
-				author: item.time || "",
+            // 一般 Commit
+            bObj.commit({
+                hash: shortSha,
+                subject: msgTitle,
+                author: c.time || "",
                 tags: commitTags,
-				onMessageClick: () => openCommitModal(sha)
-			});
+                onMessageClick: () => openCommitModal(sha)
+            });
 		});
 	}
 
@@ -2040,58 +2072,141 @@
 		});
 	}
 
-	function renderCommits() {
+	// ==========================================
+	// 🌟 非同步分頁載入 Commit 歷史紀錄
+	// ==========================================
+	let currentCommitPage = 1;
+	const commitsPerPage = 25;
+
+	async function fetchAndRenderCommits(page = 1) {
 		const tbody = document.getElementById('commit-table-body');
-		tbody.innerHTML = '';
-		
-		// 🌟 自動抓取陣列長度，更新標題右側的 Commit 總次數
+		const paginationContainer = document.getElementById('pagination-container');
+		const pageInfoText = document.getElementById('page-info-text');
 		const badge = document.getElementById('commit-count-badge');
-		if (badge) badge.innerText = `${commits.length} 次 Commit`;
-
-		commits.forEach(item => {
-			let fileHTML = '<small class="text-muted">-</small>';
-			if (item.files && item.files.length > 0) {
-				// 🌟 核心修改：將歷史紀錄中的檔名變成可點選的下載標籤
-				const fileLinks = item.files.map(fullPath => {
-					const fileName = fullPath.split('/').pop();
-					return `<a href="/repo/${repoName}/download/${item.hexsha}/${fullPath}" 
-							   title="點擊下載此版本的 ${fullPath}" 
-							   class="badge bg-light text-primary border border-primary text-decoration-none me-1"
-							   style="font-size: 0.85rem; transition: 0.2s;">
-							   ⬇️ ${fileName}
-							</a>`;
-				});
-				fileHTML = fileLinks.join(' ');
-			}
+		
+		// 顯示 Loading 狀態
+		tbody.innerHTML = `
+			<tr>
+				<td colspan="4" class="text-center py-5 text-muted">
+					<div class="spinner-border spinner-border-sm text-primary mb-2" role="status"></div>
+					<div class="fw-bold">讀取第 ${page} 頁資料中...</div>
+				</td>
+			</tr>`;
+		
+		try {
+			const response = await fetch(`/api/repo/${repoName}/commits?page=${page}&limit=${commitsPerPage}`);
+			const data = await response.json();
 			
-			//🌟 在這裡新增一個打包下載的按鈕
-			const zipBtn = `<a href="/repo/${repoName}/download_zip/${item.hexsha}" 
-                               class="btn btn-sm btn-outline-dark px-2 py-0" 
-                               title="下載此時間點的完整專案">📦 ZIP</a>`;
+			if (data.error) throw new Error(data.error);
 
-            // 🌟 新增：從特定歷史點建立分支的按鈕
-			const branchBtn = `<button onclick="createBranchFromCommit('${item.hexsha}')" 
-                               class="btn btn-sm btn-outline-success px-2 py-0 ms-1" 
-                               title="從這個歷史時間點建立新分支">🌱 分支</button>`;
+			// 更新總數 Badge
+			if (badge) badge.innerText = `${data.total_count} 次 Commit`;
+			
+			tbody.innerHTML = '';
+			
+			if (!data.commits || data.commits.length === 0) {
+				tbody.innerHTML = `<tr><td colspan="4" class="text-center py-4 text-muted">此專案尚無 Commit 紀錄。</td></tr>`;
+				paginationContainer.classList.add('d-none');
+				return;
+			}
 
-			tbody.innerHTML += `
-				<tr>
-					<td class="align-middle text-nowrap">
-						<a href="javascript:void(0);" onclick="openCommitModal('${item.hexsha}')" class="font-monospace fw-bold text-decoration-none me-2">${item.hexsha.substring(0, 7)}</a>
-						${zipBtn} ${branchBtn}
-					</td>
-					<td class="align-middle">${fileHTML}</td>
-					<td class="align-middle" style="max-width: 300px;">
-                        <div class="d-flex align-items-center">
-                            <span class="text-truncate" style="min-width: 0;">${item.message.split('\n')[0]}</span>
-                            ${item.message.includes('\n') 
-                                ? `<span class="badge bg-light text-secondary border ms-1 flex-shrink-0" style="cursor:pointer;" data-msg="${encodeURIComponent(item.message)}" onclick="event.stopPropagation(); openMessageModal(decodeURIComponent(this.getAttribute('data-msg')))" title="點擊閱讀詳細備註">...</span>` 
-                                : ''}
-                        </div>
-                    </td>
-					<td class="align-middle"><small class="text-muted">${item.time}</small></td>
-				</tr>`;
-		});
+			// 渲染表格內容
+			data.commits.forEach(item => {
+				let fileHTML = '<small class="text-muted">-</small>';
+				if (item.files && item.files.length > 0) {
+					const fileLinks = item.files.map(fullPath => {
+						const fileName = fullPath.split('/').pop();
+						return `<a href="/repo/${repoName}/download/${item.hexsha}/${fullPath}" title="點擊下載此版本的 ${fullPath}" class="badge bg-light text-primary border border-primary text-decoration-none me-1" style="font-size: 0.85rem;">⬇️ ${fileName}</a>`;
+					});
+					fileHTML = fileLinks.join(' ');
+				}
+				
+				const zipBtn = `<a href="/repo/${repoName}/download_zip/${item.hexsha}" class="btn btn-sm btn-outline-dark px-2 py-0" title="下載此時間點的完整專案">📦 ZIP</a>`;
+				const branchBtn = `<button onclick="createBranchFromCommit('${item.hexsha}')" class="btn btn-sm btn-outline-success px-2 py-0 ms-1" title="從這個歷史時間點建立新分支">🌱 分支</button>`;
+
+				const firstLineMsg = item.message.split('\n')[0];
+				const badgeHtml = item.message.includes('\n') ? `<span class="badge bg-light text-secondary border ms-1 flex-shrink-0" style="cursor:pointer;" data-msg="${encodeURIComponent(item.message)}" onclick="event.stopPropagation(); openMessageModal(decodeURIComponent(this.getAttribute('data-msg')))" title="點擊閱讀詳細備註">...</span>` : '';
+
+				tbody.innerHTML += `
+					<tr>
+						<td class="align-middle text-nowrap">
+							<a href="javascript:void(0);" onclick="openCommitModal('${item.hexsha}')" class="font-monospace fw-bold text-decoration-none me-2">${item.hexsha.substring(0, 7)}</a>
+							${zipBtn} ${branchBtn}
+						</td>
+						<td class="align-middle">${fileHTML}</td>
+						<td class="align-middle" style="max-width: 300px;">
+							<div class="d-flex align-items-center">
+								<span class="text-truncate" style="min-width: 0;">${firstLineMsg}</span>
+								${badgeHtml}
+							</div>
+						</td>
+						<td class="align-middle"><small class="text-muted">${item.time}</small></td>
+					</tr>`;
+			});
+
+			// 渲染分頁按鈕
+			renderPagination(data.page, data.total_pages);
+			pageInfoText.innerText = `顯示第 ${data.page} 頁 / 共 ${data.total_pages} 頁 (總計 ${data.total_count} 筆)`;
+			paginationContainer.classList.remove('d-none');
+			currentCommitPage = data.page;
+
+		} catch (err) {
+			tbody.innerHTML = `<tr><td colspan="4" class="text-center py-4 text-danger fw-bold">讀取失敗: ${err.message}</td></tr>`;
+		}
+	}
+
+	function renderPagination(currentPage, totalPages) {
+		const ul = document.getElementById('pagination-buttons');
+		ul.innerHTML = '';
+		
+		// 上一頁按鈕
+		const prevDisabled = currentPage === 1 ? 'disabled' : '';
+		ul.innerHTML += `<li class="page-item ${prevDisabled}"><a class="page-link shadow-sm" href="javascript:void(0);" onclick="fetchAndRenderCommits(${currentPage - 1})">上一頁</a></li>`;
+		
+		// 動態計算顯示的頁碼區間 (最多顯示前後各 2 頁)
+		let startPage = Math.max(1, currentPage - 2);
+		let endPage = Math.min(totalPages, currentPage + 2);
+		
+		if (startPage > 1) {
+			ul.innerHTML += `<li class="page-item"><a class="page-link shadow-sm" href="javascript:void(0);" onclick="fetchAndRenderCommits(1)">1</a></li>`;
+			if (startPage > 2) ul.innerHTML += `<li class="page-item disabled"><span class="page-link">...</span></li>`;
+		}
+		
+		for (let i = startPage; i <= endPage; i++) {
+			const activeClass = i === currentPage ? 'active' : '';
+			ul.innerHTML += `<li class="page-item ${activeClass}"><a class="page-link shadow-sm" href="javascript:void(0);" onclick="fetchAndRenderCommits(${i})">${i}</a></li>`;
+		}
+		
+		if (endPage < totalPages) {
+			if (endPage < totalPages - 1) ul.innerHTML += `<li class="page-item disabled"><span class="page-link">...</span></li>`;
+			ul.innerHTML += `<li class="page-item"><a class="page-link shadow-sm" href="javascript:void(0);" onclick="fetchAndRenderCommits(${totalPages})">${totalPages}</a></li>`;
+		}
+
+		// 下一頁按鈕
+		const nextDisabled = currentPage === totalPages ? 'disabled' : '';
+		ul.innerHTML += `<li class="page-item ${nextDisabled}"><a class="page-link shadow-sm" href="javascript:void(0);" onclick="fetchAndRenderCommits(${currentPage + 1})">下一頁</a></li>`;
+	}
+	
+	// 🌟 新增：副檔名與 Monaco 語言引擎的對應字典
+	function getMonacoLanguage(ext) {
+		const langMap = {
+			'js': 'javascript',
+			'ts': 'typescript',
+			'json': 'json',
+			'py': 'python',
+			'go': 'go',
+			'html': 'html',
+			'css': 'css',
+			'md': 'markdown',
+			'yml': 'yaml',        // 🐳 支援 docker-compose.yml
+			'yaml': 'yaml',       // 🐳 支援一般 yaml 檔
+			'sh': 'shell',
+			'bash': 'shell',
+			'sql': 'sql',
+			'xml': 'xml',
+			'dockerfile': 'dockerfile' // 🐳 順便支援 Dockerfile
+		};
+		return langMap[ext] || 'plaintext';
 	}
 
 </script>

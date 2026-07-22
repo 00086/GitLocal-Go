@@ -21,8 +21,15 @@
         nav, .header-controls { flex-shrink: 0; }
         #edit-form { flex: 1; display: flex; flex-direction: column; min-height: 0; margin-bottom: 0; }
         
+        /* 🌟 1. 為所有編輯/預覽容器加上 min-height: 0，防止長內容撐爆高度 */
         #editor-container, #preview-container, #image-container { 
-            flex: 1; position: relative; margin-bottom: 1rem; 
+            flex: 1; min-height: 0; position: relative; margin-bottom: 1rem; 
+        }
+        
+        /* 🌟 2. 讓 #preview-container 成為 Flex 縱向容器 */
+        #preview-container {
+            display: flex;
+            flex-direction: column;
         }
         
         .engine-wrapper { 
@@ -38,7 +45,18 @@
         .cm-editor, .monaco-pane-wrapper { flex: 1; height: 100%; outline: none; }
         .cm-scroller { overflow: auto !important; font-family: 'Consolas', 'Courier New', monospace !important; }
         
-        #preview-pane { flex: 1; height: 100%; overflow-y: auto; border: 1px solid var(--bs-border-color); border-radius: 6px; padding: 30px; background-color: var(--bs-body-bg); color: var(--bs-body-color); }
+        /* 🌟 3. 確保 #preview-pane 在 Flex 容器內鎖死高度並開啟垂直捲軸 */
+        #preview-pane { 
+            flex: 1; 
+            min-height: 0; 
+            height: 100%; 
+            overflow-y: auto !important; 
+            border: 1px solid var(--bs-border-color); 
+            border-radius: 6px; 
+            padding: 30px; 
+            background-color: var(--bs-body-bg); 
+            color: var(--bs-body-color); 
+        }
         .image-preview { max-width: 100%; max-height: 550px; border-radius: 6px; }
         .bg-checkered { background-image: linear-gradient(45deg, #f0f0f0 25%, transparent 25%), linear-gradient(-45deg, #f0f0f0 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #f0f0f0 75%), linear-gradient(-45deg, transparent 75%, #f0f0f0 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px; }
         [data-bs-theme="dark"] .bg-checkered { background-image: linear-gradient(45deg, #333 25%, transparent 25%), linear-gradient(-45deg, #333 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #333 75%), linear-gradient(-45deg, transparent 75%, #333 75%); }
@@ -181,6 +199,7 @@
         import { php } from 'https://esm.sh/@codemirror/lang-php';
         import { sql } from 'https://esm.sh/@codemirror/lang-sql';
         import { rust } from 'https://esm.sh/@codemirror/lang-rust';
+		import { yaml } from 'https://esm.sh/@codemirror/lang-yaml';
 
         const filePath = "{{ .file_path }}";
         const repoName = "{{ .repo_name }}";
@@ -331,6 +350,11 @@
             const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
             easyMdeInstance.codemirror.setOption("lineNumbers", true);
             easyMdeInstance.codemirror.setOption("theme", isDark ? "darcula" : "default");
+
+            // 🌟 新增：如果副檔名是 yml/yaml，強制把底層的語法模式切換為 yaml
+            if (ext === 'yml' || ext === 'yaml') {
+                easyMdeInstance.codemirror.setOption("mode", "yaml");
+            }
             
             setTimeout(() => {
                 applyFontSizeToDOM(); 
@@ -416,7 +440,8 @@
                 'go': cpp(), 'mod': cpp(),
                 'c': cpp(), 'cpp': cpp(), 'h': cpp(), 'hpp': cpp(), 'cs': cpp(),
                 'java': java(), 'php': php(), 'sql': sql(), 'rs': rust(),
-                'asp': html(), 'aspx': html()
+                'asp': html(), 'aspx': html(),
+				'yml': yaml(), 'yaml': yaml()
             };
             return mapping[extension] || [];
         }
