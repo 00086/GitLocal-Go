@@ -205,6 +205,41 @@
         const repoName = "{{ .repo_name }}";
         const ext = filePath.split('.').pop().toLowerCase();
         
+        // ==========================================
+        // 🌟 核心修正：攔截 Markdown 圖片，相容最新版 marked.js
+        // ==========================================
+        marked.use({
+            renderer: {
+                image(token) {
+                    // 防呆：相容新版 v12 (物件) 與舊版 (字串) 的參數傳遞
+                    let href = typeof token === 'string' ? token : token.href;
+                    let text = typeof token === 'string' ? arguments[2] : token.text;
+                    let title = typeof token === 'string' ? arguments[1] : token.title;
+
+                    // 如果是相對路徑 (不以 http 或 data: 開頭)
+                    if (href && !href.startsWith('http') && !href.startsWith('data:')) {
+                        // 去除開頭多餘的 ./ 或 /
+                        let cleanHref = href.replace(/^\.\//, '').replace(/^\//, ''); 
+                        
+                        // 計算當前編輯的檔案所在的資料夾
+                        const dirParts = filePath.split('/');
+                        dirParts.pop(); 
+                        const currentDir = dirParts.length > 0 ? dirParts.join('/') + '/' : '';
+                        
+                        // 組合成呼叫 Go 後端的真實取圖網址
+                        href = `/repo/${repoName}/raw/${currentDir}${cleanHref}`;
+                    }
+                    
+                    // 回傳 Bootstrap 響應式圖片 HTML
+                    let out = `<img src="${href}" alt="${text || ''}" style="max-width: 100%; height: auto; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);"`;
+                    if (title) out += ` title="${title}"`;
+                    out += '>';
+                    return out;
+                }
+            }
+        });
+        // ==========================================
+
         const editorContainer = document.getElementById('editor-container');
         const previewContainer = document.getElementById('preview-container');
         const imageContainer = document.getElementById('image-container');

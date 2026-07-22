@@ -478,6 +478,35 @@
 	const branches = {{ .branchesJson }};
 	const releases = {{ .releasesJson }}; // 🌟 新增這行接收 Release 資料
 	
+	// ==========================================
+	// 🌟 新增：全域攔截器 - 處理 Markdown 中的相對路徑圖片
+	// ==========================================
+	window.currentReadmeDir = ""; // 用來儲存當前 README 的所在資料夾
+	marked.use({
+		renderer: {
+			image(token) {
+				// 防呆：相容新版 v12 (物件) 與舊版 (字串) 的參數傳遞
+				let href = typeof token === 'string' ? token : token.href;
+				let text = typeof token === 'string' ? arguments[2] : token.text;
+				let title = typeof token === 'string' ? arguments[1] : token.title;
+
+				// 如果是相對路徑 (不以 http 或 data: 開頭)
+				if (href && !href.startsWith('http') && !href.startsWith('data:')) {
+					let cleanHref = href.replace(/^\.\//, '').replace(/^\//, ''); 
+					// 組合成呼叫 Go 後端的真實取圖網址
+					href = `/repo/${repoName}/raw/${window.currentReadmeDir}${cleanHref}`;
+				}
+				
+				// 回傳 Bootstrap 響應式圖片 HTML
+				let out = `<img src="${href}" alt="${text || ''}" style="max-width: 100%; height: auto; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);"`;
+				if (title) out += ` title="${title}"`;
+				out += '>';
+				return out;
+			}
+		}
+	});
+	// ==========================================
+	
 	// 🌟 核心修改 1：網頁載入時，優先從 sessionStorage 讀取上次停留的資料夾
 	const storageKey = `currentDir_${repoName}`;
 	let currentDir = sessionStorage.getItem(storageKey) || ""; 
@@ -1068,7 +1097,12 @@
 			readmeHeader.innerHTML = headerTitle;
 			readmeContent.innerHTML = '<span class="text-muted">載入說明文件中...</span>';
 			
-			// 👇 請修改下面這行 fetch 👇
+			// 🌟 關鍵新增：更新當前 README 所在的資料夾路徑 (供上方的 marked 攔截器使用)
+			let dirParts = readmeFileToLoad.path.split('/');
+			dirParts.pop(); // 移除檔名，保留資料夾路徑
+			window.currentReadmeDir = dirParts.length > 0 ? dirParts.join('/') + '/' : '';
+
+			// 👇 載入並解析 Markdown
 			fetch(`/repo/${repoName}/raw/${readmeFileToLoad.path}?t=${new Date().getTime()}`)
 				.then(response => response.text())
 				.then(text => {
