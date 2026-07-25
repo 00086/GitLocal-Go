@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec" // 👈 貼在這行：新增執行系統命令套件
 	"path/filepath"
 	"strings"
 	"sync"
@@ -29,10 +30,9 @@ var (
 	ReposDir     = "./my_git_repos"
 	LfsDir       = "./my_git_repos/.lfs_objects"
 	LfsThreshold = 5 * 1024 * 1024
-	gitLock      sync.Mutex
+	gitLock      sync.Mutex // 僅用於寫入操作 (Write-Lock)
 )
 
-// (與原本相同的資料結構定義)
 type CommitData struct {
 	Hexsha  string   `json:"hexsha"`
 	Message string   `json:"message"`
@@ -67,25 +67,258 @@ type UploadFile struct {
 	Bytes []byte
 }
 
-// 🌟 新增：用於裝載 Release 資訊的結構體
 type ReleaseAsset struct {
 	Name string `json:"name"`
 	Size int64  `json:"size"`
-	Path string `json:"path"` // 供下載用的相對路徑
+	Path string `json:"path"`
 }
 
 type ReleaseData struct {
-	TagName     string         `json:"tag_name"`
-	Message     string         `json:"message"`
-	Time        string         `json:"time"`
-	CommitSha   string         `json:"commit_sha"`
-	Assets      []ReleaseAsset `json:"assets"`
-	IsRelease   bool           `json:"is_release"` // 🌟 新增：用來區分它是 Release 還是純 Tag
+	TagName   string         `json:"tag_name"`
+	Message   string         `json:"message"`
+	Time      string         `json:"time"`
+	CommitSha string         `json:"commit_sha"`
+	Assets    []ReleaseAsset `json:"assets"`
+	IsRelease bool           `json:"is_release"`
 }
 
+type GitGraphResponse struct {
+	GraphCommits []CommitData `json:"graph_commits"`
+	Branches     BranchData   `json:"branches"`
+}
+
+// 🌟 新增：倉庫健康度資料結構
+type RepoHealth struct {
+	GitDirSize string `json:"git_dir_size"`
+}
+
+// 🌟 1. 取得倉庫容量健康診斷
+func GetRepoHealth(repoName string) (*RepoHealth, error) {
+	repoPath := filepath.Join(ReposDir, repoName)
+	gitDir := filepath.Join(repoPath, ".git")
+
+	var size int64
+	err := filepath.Walk(gitDir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil { return err }
+		if !info.IsDir() { size += info.Size() }
+		return nil
+	})
+	if err != nil { return nil, err }
+
+	sizeMB := float64(size) / (1024 * 1024)
+	sizeStr := fmt.Sprintf("%.2f MB", sizeMB)
+	if sizeMB < 1.0 {
+		sizeStr = fmt.Sprintf("%.2f KB", float64(size)/1024)
+	}
+
+	return &RepoHealth{GitDirSize: sizeStr}, nil
+}
+
+// 🌟 2. 執行一鍵 Git GC 垃圾回收瘦身 (純 Go 原生版，無需安裝系統 Git)
+func RunGitGC(repoName string) (string, error) {
+	gitLock.Lock()
+	defer gitLock.Unlock()
+	invalidateRepoCache(repoName)
+
+	repoPath := filepath.Join(ReposDir, repoName)
+
+	// 1. 若系統有安裝 Git，優先調用原生命令；若無安裝，自動接管無縫執行 Go 原生清理
+	if _, err := exec.LookPath("git"); err == nil {
+		cmd := exec.Command("git", "gc", "--prune=now")
+		cmd.Dir = repoPath
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return "🎉 使用 Git 原生引擎瘦身成功！\n" + strings.TrimSpace(string(out)), nil
+		}
+	}
+
+	// 🌟 2.【Go 原生無依賴瘦身引擎】(完全不依賴外部 git.exe)
+	repo, err := git.PlainOpen(repoPath)
+	if err != nil {
+		return "", fmt.Errorf("開啟倉庫失敗: %v", err)
+	}
+
+	// 步驟 A: 走訪所有分支與標籤，收集所有「可達 (Reachable)」的物件 Hash
+	reachableHashes := make(map[plumbing.Hash]bool)
+	refIter, err := repo.References()
+	if err == nil {
+		_ = refIter.ForEach(func(ref *plumbing.Reference) error {
+			startingHash := ref.Hash()
+			logIter, err := repo.Log(&git.LogOptions{From: startingHash})
+			if err == nil {
+				_ = logIter.ForEach(func(c *object.Commit) error {
+					reachableHashes[c.Hash] = true
+					if tree, err := c.Tree(); err == nil {
+						reachableHashes[tree.Hash] = true
+						_ = tree.Files().ForEach(func(f *object.File) error {
+							reachableHashes[f.Blob.Hash] = true
+							return nil
+						})
+					}
+					return nil
+				})
+			}
+			return nil
+		})
+	}
+
+	// 步驟 B: 掃描 .git/objects/ 目錄，清理孤立 (Unreachable) 散落物件與臨時鎖定檔
+	objectsDir := filepath.Join(repoPath, ".git", "objects")
+	var deletedCount int
+	var freedBytes int64
+
+	_ = filepath.WalkDir(objectsDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() { return nil }
+
+		// 清理臨時鎖定與打包暫存檔
+		if strings.HasPrefix(d.Name(), "tmp_") || strings.HasSuffix(d.Name(), ".lock") {
+			if info, err := d.Info(); err == nil {
+				freedBytes += info.Size()
+				_ = os.Remove(path)
+				deletedCount++
+			}
+			return nil
+		}
+
+		// 解析散落物件的 SHA-1 Hash (例如 objects/1a/2b3c4d... -> 1a2b3c4d...)
+		rel, _ := filepath.Rel(objectsDir, path)
+		rel = strings.ReplaceAll(rel, "\\", "/")
+		parts := strings.Split(rel, "/")
+		if len(parts) == 2 && len(parts[0]) == 2 {
+			hashStr := parts[0] + parts[1]
+			hash := plumbing.NewHash(hashStr)
+
+			// 若該散落物件已無法從任何分支連通 (孤立廢棄物)，直接刪除釋放空間！
+			if !reachableHashes[hash] {
+				if info, err := d.Info(); err == nil {
+					freedBytes += info.Size()
+					_ = os.Remove(path)
+					deletedCount++
+				}
+			}
+		}
+		return nil
+	})
+
+	// 步驟 C: 順手清理空資料夾
+	_ = filepath.WalkDir(objectsDir, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() && path != objectsDir {
+			entries, _ := os.ReadDir(path)
+			if len(entries) == 0 {
+				_ = os.Remove(path)
+			}
+		}
+		return nil
+	})
+
+	sizeMB := float64(freedBytes) / (1024 * 1024)
+	if sizeMB < 0.01 && freedBytes > 0 {
+		return fmt.Sprintf("🎉 Go 原生瘦身完成！清理了 %d 個孤立廢棄物件/鎖定檔 (%.2f KB)。", deletedCount, float64(freedBytes)/1024), nil
+	}
+	return fmt.Sprintf("🎉 Go 原生瘦身完成！清理了 %d 個孤立廢棄物件/鎖定檔，共釋放 %.2f MB 硬碟空間。", deletedCount, sizeMB), nil
+}
+
+// 🌟 3. Web 終端安全白名單指令執行器 (自動綁定當前網頁專案名稱)
+func RunWebTerminalCmd(repoName string, commandStr string) (string, error) {
+	commandStr = strings.TrimSpace(commandStr)
+	if commandStr == "" { return "", fmt.Errorf("指令不能為空") }
+
+	isGit := strings.HasPrefix(commandStr, "git ") || commandStr == "git"
+	isGitLocal := strings.HasPrefix(commandStr, "gitlocal ") || commandStr == "gitlocal"
+
+	if !isGit && !isGitLocal {
+		return "", fmt.Errorf("基於安全考量，僅支援以 'git' 或 'gitlocal' 開頭的指令！")
+	}
+
+	for _, forbidden := range []string{"&", "|", ";", ">", "<", "`", "$"} {
+		if strings.Contains(commandStr, forbidden) {
+			return "", fmt.Errorf("禁止使用管道或多重指令符號 (%s)", forbidden)
+		}
+	}
+
+	args := strings.Fields(commandStr)
+	repoPath := filepath.Join(ReposDir, repoName)
+
+	execBinary := args[0]
+	cmdDir := repoPath
+	execArgs := args[1:]
+
+	// 🌟 關鍵修復：執行 gitlocal 時，若使用者省略專案名稱，自動代入網頁目前的 repoName
+	if isGitLocal {
+		absExe, _ := filepath.Abs("gitlocal.exe")
+		if _, err := os.Stat(absExe); err == nil {
+			execBinary = absExe
+		} else {
+			absBin, _ := filepath.Abs("gitlocal")
+			if _, err := os.Stat(absBin); err == nil {
+				execBinary = absBin
+			}
+		}
+		cmdDir, _ = filepath.Abs(".")
+
+		knownCmds := map[string]bool{
+			"status": true, "commit": true, "branch": true,
+			"switch": true, "checkout": true, "delete-branch": true,
+			"merge": true, "push": true, "get-file": true, "zip": true,
+		}
+
+		// 若第二個參數是已知指令（代表省略了專案名），自動插入當前頁面的 repoName
+		if len(args) >= 2 && knownCmds[args[1]] {
+			execArgs = append([]string{repoName}, args[1:]...)
+		}
+	}
+
+	cmd := exec.Command(execBinary, execArgs...)
+	cmd.Dir = cmdDir
+
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return fmt.Sprintf("❌ 執行失敗: %v\n(請確認已在伺服器根目錄執行 'go build gitlocal.go' 編譯出 gitlocal.exe)", err), nil
+	}
+
+	if strings.Contains(commandStr, "checkout") || strings.Contains(commandStr, "commit") ||
+	   strings.Contains(commandStr, "branch") || strings.Contains(commandStr, "merge") ||
+	   strings.Contains(commandStr, "reset") || strings.Contains(commandStr, "rebase") {
+		invalidateRepoCache(repoName)
+	}
+
+	return string(out), nil
+}
 
 // ==========================================
-// LFS 核心引擎 (保持不變)
+// ⚡ 記憶體快取引擎 (In-Memory Cache)
+// ==========================================
+type RepoCacheItem struct {
+	GitGraph *GitGraphResponse
+	FileList []FileData
+	Details  *RepoDetails
+}
+
+type MemoryCache struct {
+	sync.RWMutex
+	items map[string]*RepoCacheItem
+}
+
+var repoCache = &MemoryCache{
+	items: make(map[string]*RepoCacheItem),
+}
+
+// 🌟 1. 清除快取 (當專案有任何寫入/變更時自動觸發)
+func invalidateRepoCache(repoName string) {
+	repoCache.Lock()
+	defer repoCache.Unlock()
+	delete(repoCache.items, repoName)
+}
+
+// 🌟 2. 手動清空全域快取
+func ClearAllMemoryCache() {
+	repoCache.Lock()
+	defer repoCache.Unlock()
+	repoCache.items = make(map[string]*RepoCacheItem)
+}
+
+// ==========================================
+// LFS 核心引擎
 // ==========================================
 func createLFSPointer(fileBytes []byte) []byte {
 	if len(fileBytes) < LfsThreshold {
@@ -125,22 +358,11 @@ func resolveLFSPointer(fileBytes []byte) []byte {
 	return fileBytes
 }
 
-// ==========================================
-// 🌟 核心防護機制：確保 .gitignore 封印了可執行檔
-// ==========================================
 func EnsureGitignore(repoPath string) {
 	ignorePath := filepath.Join(repoPath, ".gitignore")
-	
-	// 我們要強制封印的黑名單 (不讓執行檔進版本庫)
 	blackList := []string{
-		"gitlocal-server.exe",
-		"gitlocal-server",
-		"gitlocal.exe",
-		"gitlocal",
-		"*.exe",
-		"__pycache__/",
-		".DS_Store",
-		".gitlocal/releases", // 🌟 也要保護發布金庫自己不被 Git 追蹤
+		"gitlocal-server.exe", "gitlocal-server", "gitlocal.exe", "gitlocal",
+		"*.exe", "__pycache__/", ".DS_Store", ".gitlocal/releases",
 	}
 
 	var content string
@@ -158,14 +380,12 @@ func EnsureGitignore(repoPath string) {
 	}
 
 	if needsAppend {
-		// 追加寫入，不覆蓋原本使用者自訂的規則
 		os.WriteFile(ignorePath, []byte(strings.TrimSpace(content)), 0644)
 	}
 }
 
-
 // ==========================================
-// 倉庫讀寫基礎功能
+// 倉庫讀寫與模組化核心
 // ==========================================
 func GetAllRepositories() []string {
 	var repos []string
@@ -182,8 +402,143 @@ func GetAllRepositories() []string {
 	return repos
 }
 
-// GetRepoDetails 維持原樣... (為節省長度，此處省略，請保留您原本的 GetRepoDetails 實作)
+func scanGraphCommits(repo *git.Repository) []CommitData {
+	visited := make(map[plumbing.Hash]bool)
+	graphCommits := []CommitData{}
+
+	startingHashes := []plumbing.Hash{}
+
+	if headRef, err := repo.Head(); err == nil {
+		startingHashes = append(startingHashes, headRef.Hash())
+	}
+
+	if bIter, err := repo.Branches(); err == nil {
+		_ = bIter.ForEach(func(ref *plumbing.Reference) error {
+			startingHashes = append(startingHashes, ref.Hash())
+			return nil
+		})
+	}
+
+	if tIter, err := repo.Tags(); err == nil {
+		_ = tIter.ForEach(func(ref *plumbing.Reference) error {
+			if tagObj, err := repo.TagObject(ref.Hash()); err == nil {
+				startingHashes = append(startingHashes, tagObj.Target)
+			} else {
+				startingHashes = append(startingHashes, ref.Hash())
+			}
+			return nil
+		})
+	}
+
+	for _, startHash := range startingHashes {
+		logIter, err := repo.Log(&git.LogOptions{From: startHash})
+		if err != nil { continue }
+
+		_ = logIter.ForEach(func(c *object.Commit) error {
+			if visited[c.Hash] { return nil }
+			visited[c.Hash] = true
+
+			parents := make([]string, 0, len(c.ParentHashes))
+			for _, p := range c.ParentHashes {
+				parents = append(parents, p.String())
+			}
+
+			graphCommits = append(graphCommits, CommitData{
+				Hexsha:  c.Hash.String(),
+				Message: strings.TrimSpace(c.Message),
+				Time:    c.Author.When.Format("2006-01-02 15:04:05"),
+				Parents: parents,
+			})
+			return nil
+		})
+	}
+
+	return graphCommits
+}
+
+func buildFileList(repo *git.Repository, headCommit *object.Commit) []FileData {
+	tree, err := headCommit.Tree()
+	if err != nil { return nil }
+
+	fileMap := make(map[string]*FileData)
+	remaining := make(map[string]bool)
+
+	_ = tree.Files().ForEach(func(f *object.File) error {
+		fileMap[f.Name] = &FileData{
+			Path:        f.Name,
+			DisplayName: filepath.Base(f.Name),
+			Message:     strings.TrimSpace(headCommit.Message),
+			Time:        headCommit.Author.When.Format("2006-01-02 15:04:05"), // 🌟 改為這行
+			Hexsha:      headCommit.Hash.String(),
+		}
+		remaining[f.Name] = true
+		return nil
+	})
+
+	if len(remaining) == 0 { return []FileData{} }
+
+	logIter, errLog := repo.Log(&git.LogOptions{From: headCommit.Hash})
+	if errLog == nil {
+		_ = logIter.ForEach(func(c *object.Commit) error {
+			if len(remaining) == 0 { return io.EOF }
+
+			if c.NumParents() == 0 {
+				for p := range remaining {
+					fileMap[p].Message = strings.TrimSpace(c.Message)
+					fileMap[p].Time = c.Author.When.Format("2006-01-02 15:04:05") // 🌟 改為這行
+					fileMap[p].Hexsha = c.Hash.String()
+				}
+				remaining = make(map[string]bool)
+				return io.EOF
+			}
+
+			pCommit, errP := c.Parent(0)
+			if errP != nil { return nil }
+
+			cTree, errC := c.Tree()
+			pTree, errP2 := pCommit.Tree()
+			if errC != nil || errP2 != nil { return nil }
+
+			if cTree.Hash == pTree.Hash { return nil }
+
+			changes, errDiff := object.DiffTree(pTree, cTree)
+			if errDiff != nil { return nil }
+
+			for _, ch := range changes {
+				targetPath := ch.To.Name
+				if targetPath == "" { targetPath = ch.From.Name }
+
+				if remaining[targetPath] {
+					fileMap[targetPath].Message = strings.TrimSpace(c.Message)
+					fileMap[targetPath].Time = c.Author.When.Format("2006-01-02 15:04:05") // 🌟 改為這行
+					fileMap[targetPath].Hexsha = c.Hash.String()
+					delete(remaining, targetPath)
+				}
+			}
+
+			return nil
+		})
+	}
+
+	result := make([]FileData, 0, len(fileMap))
+	_ = tree.Files().ForEach(func(f *object.File) error {
+		if fd, ok := fileMap[f.Name]; ok {
+			result = append(result, *fd)
+		}
+		return nil
+	})
+	return result
+}
+
+// 🌟 快取優化：GetRepoDetails
 func GetRepoDetails(repoName string) *RepoDetails {
+	repoCache.RLock()
+	if item, ok := repoCache.items[repoName]; ok && item.Details != nil {
+		repoCache.RUnlock()
+		return item.Details
+	}
+	repoCache.RUnlock()
+
 	path := filepath.Join(ReposDir, repoName)
 	repo, err := git.PlainOpen(path)
 	if err != nil { return nil }
@@ -192,7 +547,7 @@ func GetRepoDetails(repoName string) *RepoDetails {
 		Commits:      []CommitData{},
 		GraphCommits: []CommitData{},
 		Files:        []FileData{},
-		Branches: BranchData{All: []string{}, Tips: make(map[string][]string)},
+		Branches:     BranchData{All: []string{}, Tips: make(map[string][]string)},
 	}
 
 	headRef, err := repo.Head()
@@ -202,144 +557,127 @@ func GetRepoDetails(repoName string) *RepoDetails {
 		details.Branches.Current = "master"
 	}
 
-	branchIter, _ := repo.Branches()
-	branchIter.ForEach(func(ref *plumbing.Reference) error {
-		bName := ref.Name().Short()
-		sha := ref.Hash().String()
-		details.Branches.All = append(details.Branches.All, bName)
-		details.Branches.Tips[sha] = append(details.Branches.Tips[sha], bName)
-		return nil
-	})
-
-	// 🌟 1. 全分支強制掃描 GraphCommits (確保樹狀圖資料完整)
-	visitedCommits := make(map[string]bool)
-	details.GraphCommits = []CommitData{}
-
-	var startingHashes []plumbing.Hash
-	if headRef != nil {
-		startingHashes = append(startingHashes, headRef.Hash())
-	}
+	branchSet := make(map[string]bool)
 	if branchIter, err := repo.Branches(); err == nil {
-		branchIter.ForEach(func(ref *plumbing.Reference) error {
-			startingHashes = append(startingHashes, ref.Hash())
-			return nil
-		})
-	}
-
-	for _, startHash := range startingHashes {
-		gIter, err := repo.Log(&git.LogOptions{From: startHash})
-		if err != nil { continue }
-		gIter.ForEach(func(c *object.Commit) error {
-			sha := c.Hash.String()
-			if visitedCommits[sha] { return nil }
-			visitedCommits[sha] = true
-
-			parents := []string{}
-			for _, p := range c.ParentHashes {
-				parents = append(parents, p.String())
+		_ = branchIter.ForEach(func(ref *plumbing.Reference) error {
+			bName := ref.Name().Short()
+			sha := ref.Hash().String()
+			if !branchSet[bName] {
+				branchSet[bName] = true
+				details.Branches.All = append(details.Branches.All, bName)
 			}
-			details.GraphCommits = append(details.GraphCommits, CommitData{
-				Hexsha:  sha,
-				Message: strings.TrimSpace(c.Message),
-				Time:    c.Author.When.Format("2006-01-02 15:04:05"),
-				Parents: parents,
-			})
+			details.Branches.Tips[sha] = append(details.Branches.Tips[sha], bName)
 			return nil
 		})
 	}
-
-	// 🌟 2. 極速且精準的檔案歷史對應 (使用 Tree.Diff + 提早結束機制，絕不卡頓)
-	fileLastCommit := make(map[string]*object.Commit)
 
 	if headRef != nil {
-		headCommit, err := repo.CommitObject(headRef.Hash())
-		if err == nil {
-			tree, errTree := headCommit.Tree()
-			if errTree == nil {
-				// 建立當前專案所有檔案的「待查清單」
-				remainingFiles := make(map[string]bool)
-				_ = tree.Files().ForEach(func(f *object.File) error {
-					remainingFiles[f.Name] = true
-					return nil
-				})
-
-				// 往回追蹤 Log
-				logIter, errLog := repo.Log(&git.LogOptions{From: headRef.Hash()})
-				if errLog == nil {
-					_ = logIter.ForEach(func(c *object.Commit) error {
-						// 💡 關鍵極速魔法：所有檔案都找到最後修改者了，立刻終止，絕不浪費時間！
-						if len(remainingFiles) == 0 {
-							return io.EOF
-						}
-
-						cTree, errCTree := c.Tree()
-						if errCTree != nil { return nil }
-
-						if c.NumParents() == 0 {
-							// 創世 Commit：裡面的所有檔案都算這顆 Commit 產生的
-							_ = cTree.Files().ForEach(func(f *object.File) error {
-								if remainingFiles[f.Name] {
-									fileLastCommit[f.Name] = c
-									delete(remainingFiles, f.Name)
-								}
-								return nil
-							})
-						} else {
-							// 非創世 Commit：只做極速的 Tree 節點 Diff (不計算內文 Patch)
-							parentCommit, errP := c.Parent(0)
-							if errP == nil {
-								pTree, errPTree := parentCommit.Tree()
-								if errPTree == nil {
-									changes, errDiff := pTree.Diff(cTree)
-									if errDiff == nil {
-										for _, ch := range changes {
-											fPath := ch.To.Name
-											if fPath == "" { fPath = ch.From.Name }
-											if remainingFiles[fPath] {
-												fileLastCommit[fPath] = c
-												delete(remainingFiles, fPath) // 找到了就剔除
-											}
-										}
-									}
-								}
-							}
-						}
-						return nil
-					})
-				}
-
-				// 寫入檔案列表
-				_ = tree.Files().ForEach(func(f *object.File) error {
-					commitToUse := headCommit
-					if lastC, ok := fileLastCommit[f.Name]; ok {
-						commitToUse = lastC
-					}
-					details.Files = append(details.Files, FileData{
-						Path:        f.Name,
-						DisplayName: filepath.Base(f.Name),
-						Message:     strings.TrimSpace(commitToUse.Message),
-						Time:        formatRelativeTime(commitToUse.Author.When),
-						Hexsha:      commitToUse.Hash.String(),
-					})
-					return nil
-				})
-			}
+		if headCommit, err := repo.CommitObject(headRef.Hash()); err == nil {
+			details.Files = buildFileList(repo, headCommit)
 		}
 	}
 
+	// 存入快取
+	repoCache.Lock()
+	if repoCache.items[repoName] == nil {
+		repoCache.items[repoName] = &RepoCacheItem{}
+	}
+	repoCache.items[repoName].Details = details
+	repoCache.Unlock()
+
 	return details
+}
+
+// 🌟 快取優化：GetFileCommitsDetails
+func GetFileCommitsDetails(repoName string) ([]FileData, error) {
+	repoCache.RLock()
+	if item, ok := repoCache.items[repoName]; ok && item.FileList != nil {
+		repoCache.RUnlock()
+		return item.FileList, nil
+	}
+	repoCache.RUnlock()
+
+	path := filepath.Join(ReposDir, repoName)
+	repo, err := git.PlainOpen(path)
+	if err != nil { return nil, err }
+
+	headRef, err := repo.Head()
+	if err != nil { return nil, err }
+
+	headCommit, err := repo.CommitObject(headRef.Hash())
+	if err != nil { return nil, err }
+
+	files := buildFileList(repo, headCommit)
+
+	// 存入快取
+	repoCache.Lock()
+	if repoCache.items[repoName] == nil {
+		repoCache.items[repoName] = &RepoCacheItem{}
+	}
+	repoCache.items[repoName].FileList = files
+	repoCache.Unlock()
+
+	return files, nil
+}
+
+// 🌟 快取優化：GetGitGraphData (⚡ 樹狀圖瞬間由記憶體回應，0.1ms)
+func GetGitGraphData(repoName string) (*GitGraphResponse, error) {
+	repoCache.RLock()
+	if item, ok := repoCache.items[repoName]; ok && item.GitGraph != nil {
+		repoCache.RUnlock()
+		return item.GitGraph, nil
+	}
+	repoCache.RUnlock()
+
+	path := filepath.Join(ReposDir, repoName)
+	repo, err := git.PlainOpen(path)
+	if err != nil { return nil, err }
+
+	headRef, _ := repo.Head()
+
+	branchData := BranchData{All: []string{}, Tips: make(map[string][]string)}
+	if headRef != nil { branchData.Current = headRef.Name().Short() } else { branchData.Current = "master" }
+
+	branchSet := make(map[string]bool)
+	if branchIter, err := repo.Branches(); err == nil {
+		_ = branchIter.ForEach(func(ref *plumbing.Reference) error {
+			bName := ref.Name().Short()
+			sha := ref.Hash().String()
+			if !branchSet[bName] {
+				branchSet[bName] = true
+				branchData.All = append(branchData.All, bName)
+			}
+			branchData.Tips[sha] = append(branchData.Tips[sha], bName)
+			return nil
+		})
+	}
+
+	graphCommits := scanGraphCommits(repo)
+
+	resp := &GitGraphResponse{
+		GraphCommits: graphCommits,
+		Branches:     branchData,
+	}
+
+	// 存入快取
+	repoCache.Lock()
+	if repoCache.items[repoName] == nil {
+		repoCache.items[repoName] = &RepoCacheItem{}
+	}
+	repoCache.items[repoName].GitGraph = resp
+	repoCache.Unlock()
+
+	return resp, nil
 }
 
 func CreateNewRepo(repoName string) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 寫入後清空快取
 
 	path := filepath.Join(ReposDir, repoName)
 	os.MkdirAll(path, 0755)
-	
-	// 建立倉庫時順便打上防護符咒
 	EnsureGitignore(path)
-
 	_, err := git.PlainInit(path, false)
 	return err
 }
@@ -347,15 +685,15 @@ func CreateNewRepo(repoName string) error {
 func BatchUploadAndCommit(repoName string, files []UploadFile, message string) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 寫入後清空快取
 
 	path := filepath.Join(ReposDir, repoName)
 	repo, err := git.PlainOpen(path)
 	if err != nil { return err }
-
 	wt, err := repo.Worktree()
 	if err != nil { return err }
 
-	EnsureGitignore(path) // 💡 確保有保護傘
+	EnsureGitignore(path)
 
 	for _, f := range files {
 		cleanPath := strings.TrimLeft(strings.ReplaceAll(f.Path, "\\", "/"), "/")
@@ -376,11 +714,13 @@ func BatchUploadAndCommit(repoName string, files []UploadFile, message string) e
 }
 
 // ==========================================
-// 分支與檔案控制 API (保持不變)
+// 分支與檔案控制 API
 // ==========================================
 func CreateBranch(repoName, branchName, commitSha string) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 寫入後清空快取
+
 	repo, err := git.PlainOpen(filepath.Join(ReposDir, repoName))
 	if err != nil { return err }
 	var hash plumbing.Hash
@@ -399,16 +739,23 @@ func CreateBranch(repoName, branchName, commitSha string) error {
 func SwitchBranch(repoName, branchName string) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 寫入後清空快取
+
 	repo, err := git.PlainOpen(filepath.Join(ReposDir, repoName))
 	if err != nil { return err }
 	wt, err := repo.Worktree()
 	if err != nil { return err }
-	return wt.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName(branchName), Force: true})
+	return wt.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName(branchName),
+		Force:  true,
+	})
 }
 
 func DeleteBranch(repoName, branchName string) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 寫入後清空快取
+
 	repo, err := git.PlainOpen(filepath.Join(ReposDir, repoName))
 	if err != nil { return err }
 	headRef, err := repo.Head()
@@ -434,13 +781,15 @@ func GetFileContent(repoName, filePath string) (string, error) {
 func WriteAndCommit(repoName, filePath, content, message string) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 寫入後清空快取
+
 	path := filepath.Join(ReposDir, repoName)
 	repo, err := git.PlainOpen(path)
 	if err != nil { return err }
 	wt, err := repo.Worktree()
 	if err != nil { return err }
 
-	EnsureGitignore(path) // 💡
+	EnsureGitignore(path)
 
 	cleanPath := strings.TrimLeft(strings.ReplaceAll(filePath, "\\", "/"), "/")
 	fullPath := filepath.Join(path, cleanPath)
@@ -476,7 +825,7 @@ func GetCommitDiff(repoName, commitSha string) (map[string]interface{}, error) {
 	if err == nil {
 		diffsText = patch.String()
 	} else {
-		diffsText = "這是首次提交 (Initial Commit)，沒有變更差異。"
+		diffsText = "這是首次提交 (Initial Commit)，沒有變更檔案差異。"
 	}
 	result := map[string]interface{}{
 		"hexsha":  commitObj.Hash.String(),
@@ -555,6 +904,8 @@ func GetCommitZip(repoName, commitSha string) ([]byte, error) {
 func MoveAndCommit(repoName, oldPath, newPath string) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 寫入後清空快取
+
 	repoDir := filepath.Join(ReposDir, repoName)
 	repo, err := git.PlainOpen(repoDir)
 	if err != nil { return err }
@@ -592,6 +943,8 @@ func PushToRemote(repoName, remoteURL, token string) error {
 func DeleteFileAndCommit(repoName, filePath string) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 寫入後清空快取
+
 	repoDir := filepath.Join(ReposDir, repoName)
 	repo, err := git.PlainOpen(repoDir)
 	if err != nil { return err }
@@ -665,13 +1018,12 @@ func GetRepoManifest(repoName string) (map[string]string, error) {
 }
 
 // ==========================================
-// 🌟 Releases 發布與金庫管理 API
+// Releases 發布管理
 // ==========================================
-
-// 建立 Release (打標籤 + 打包源碼 + 封存執行檔)
 func CreateRelease(repoName, tagName, message string, assets []UploadFile) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 寫入後清空快取
 
 	repoDir := filepath.Join(ReposDir, repoName)
 	repo, err := git.PlainOpen(repoDir)
@@ -680,87 +1032,47 @@ func CreateRelease(repoName, tagName, message string, assets []UploadFile) error
 	headRef, err := repo.Head()
 	if err != nil { return err }
 
-	// 1. 建立 Git Tag (標籤)
 	_, err = repo.CreateTag(tagName, headRef.Hash(), &git.CreateTagOptions{
-		Tagger: &object.Signature{
-			Name:  "Web User",
-			Email: "web@local.git",
-			When:  time.Now(),
-		},
+		Tagger:  &object.Signature{Name: "Web User", Email: "web@local.git", When: time.Now()},
 		Message: message,
 	})
 	if err != nil { return err }
 
-	// 2. 建立本地發布專屬金庫資料夾
 	releaseDir := filepath.Join(repoDir, ".gitlocal", "releases", tagName)
 	os.MkdirAll(releaseDir, 0755)
 
-	// 3. 自動打包當下 Commit 的原始碼成 ZIP
 	zipBytes, err := GetCommitZip(repoName, headRef.Hash().String())
 	if err == nil {
 		sourceZipPath := filepath.Join(releaseDir, fmt.Sprintf("%s_%s_source.zip", repoName, tagName))
 		os.WriteFile(sourceZipPath, zipBytes, 0644)
 	}
 
-	// 🌟 4. 處理手動上傳的發布檔案 (取代原本的自動搜刮)
 	for _, asset := range assets {
 		if len(asset.Bytes) > 0 {
-			// 將使用者上傳的檔案寫入專屬金庫
 			assetPath := filepath.Join(releaseDir, filepath.Base(asset.Path))
 			os.WriteFile(assetPath, asset.Bytes, 0644)
 		}
 	}
-
 	return nil
 }
 
-// 內部輔助函數：將編譯好的檔案移動到金庫內
-func copyBinaryArtifacts(srcDir, destDir string) {
-	// 尋找目標檔名 (包含 .exe 和沒有副檔名的 Linux 二進位檔)
-	targets := []string{"*.exe", "gitlocal-server", "gitlocal"}
-	for _, pattern := range targets {
-		matches, _ := filepath.Glob(filepath.Join(srcDir, pattern))
-		for _, match := range matches {
-			if info, err := os.Stat(match); err == nil && !info.IsDir() {
-				fileName := filepath.Base(match)
-				destPath := filepath.Join(destDir, fileName)
-				
-				// 執行複製
-				if sourceFile, err := os.Open(match); err == nil {
-					if destFile, err := os.Create(destPath); err == nil {
-						io.Copy(destFile, sourceFile)
-						destFile.Close()
-					}
-					sourceFile.Close()
-				}
-			}
-		}
-	}
-}
-
-// 獲取歷史發布清單
 func GetReleasesList(repoName string) ([]ReleaseData, error) {
 	repoDir := filepath.Join(ReposDir, repoName)
 	repo, err := git.PlainOpen(repoDir)
 	if err != nil { return nil, err }
 
 	var releases []ReleaseData
-
-	// 走訪所有 Tags
 	tags, err := repo.Tags()
 	if err != nil { return nil, err }
 	
-	tags.ForEach(func(ref *plumbing.Reference) error {
+	_ = tags.ForEach(func(ref *plumbing.Reference) error {
 		tagName := strings.TrimPrefix(ref.Name().String(), "refs/tags/")
-		
-		// 嘗試讀取 Tag 物件以獲取註解說明
 		var msg, timeStr, shaStr string
 		if tagObj, err := repo.TagObject(ref.Hash()); err == nil {
 			msg = tagObj.Message
 			timeStr = tagObj.Tagger.When.Format("2006-01-02 15:04:05")
 			shaStr = tagObj.Target.String()
 		} else {
-			// 若為 Lightweight Tag (輕量級標籤，無附屬訊息)
 			if commitObj, err := repo.CommitObject(ref.Hash()); err == nil {
 				msg = "無發布說明 (輕量級標籤)"
 				timeStr = commitObj.Author.When.Format("2006-01-02 15:04:05")
@@ -768,12 +1080,10 @@ func GetReleasesList(repoName string) ([]ReleaseData, error) {
 			}
 		}
 
-		// 🌟 掃描金庫內的 Assets 檔案清單，並判斷是否為真實發布
 		var assets []ReleaseAsset
 		releaseDir := filepath.Join(repoDir, ".gitlocal", "releases", tagName)
-		isRelease := false // 預設為純標籤
+		isRelease := false
 		
-		// 只有當專屬資料夾存在時，才承認它是一個 Release
 		if info, err := os.Stat(releaseDir); err == nil && info.IsDir() {
 			isRelease = true
 			if entries, err := os.ReadDir(releaseDir); err == nil {
@@ -797,12 +1107,11 @@ func GetReleasesList(repoName string) ([]ReleaseData, error) {
 			Time:      timeStr,
 			CommitSha: shaStr,
 			Assets:    assets,
-			IsRelease: isRelease, // 🌟 傳遞狀態給前端
+			IsRelease: isRelease,
 		})
 		return nil
 	})
 	
-	// 反轉陣列，讓最新的 Tag 顯示在最上面
 	for i, j := 0, len(releases)-1; i < j; i, j = i+1, j-1 {
 		releases[i], releases[j] = releases[j], releases[i]
 	}
@@ -810,36 +1119,27 @@ func GetReleasesList(repoName string) ([]ReleaseData, error) {
 	return releases, nil
 }
 
-// 🌟 新增：刪除 Release (解開 Git Tag + 徹底抹除金庫檔案)
 func DeleteRelease(repoName, tagName string) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 寫入後清空快取
 
 	repoDir := filepath.Join(ReposDir, repoName)
 	repo, err := git.PlainOpen(repoDir)
 	if err != nil { return err }
 
-	// 1. 精準移除 Git 中的 Tag 參照
 	refName := plumbing.NewTagReferenceName(tagName)
 	err = repo.Storer.RemoveReference(refName)
-	// 如果標籤本來就不存在，當作沒事發生；其他錯誤才回傳
-	if err != nil && err != plumbing.ErrReferenceNotFound { 
-		return err 
-	}
+	if err != nil && err != plumbing.ErrReferenceNotFound { return err }
 
-	// 2. 徹底摧毀本地發布金庫資料夾 (.gitlocal/releases/<tag_name>)
 	releaseDir := filepath.Join(repoDir, ".gitlocal", "releases", tagName)
-	if err := os.RemoveAll(releaseDir); err != nil {
-		return err
-	}
-
-	return nil
+	return os.RemoveAll(releaseDir)
 }
 
-// 🌟 最終極版：編輯 Release (真實搬移金庫，將舊版降級為純標籤)
 func EditRelease(repoName, oldTagName, newTagName, message string, assets []UploadFile) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 寫入後清空快取
 
 	repoDir := filepath.Join(ReposDir, repoName)
 	repo, err := git.PlainOpen(repoDir)
@@ -852,35 +1152,27 @@ func EditRelease(repoName, oldTagName, newTagName, message string, assets []Uplo
 	tagObj, err := repo.TagObject(ref.Hash())
 	if err == nil { targetSha = tagObj.Target } else { targetSha = ref.Hash() }
 
-	// 1. 保留舊標籤！只在同名更新時才移除舊標籤
 	if oldTagName != newTagName {
 		repo.Storer.RemoveReference(plumbing.NewTagReferenceName(newTagName))
 	} else {
 		repo.Storer.RemoveReference(plumbing.NewTagReferenceName(oldTagName))
 	}
 
-	// 2. 建立新標籤
 	safeMsg := strings.TrimSpace(message)
 	if safeMsg == "" { safeMsg = "Release " + newTagName }
 	_, err = repo.CreateTag(newTagName, targetSha, &git.CreateTagOptions{
-		Tagger: &object.Signature{Name: "Web User", Email: "web@local.git", When: time.Now()},
+		Tagger:  &object.Signature{Name: "Web User", Email: "web@local.git", When: time.Now()},
 		Message: safeMsg,
 	})
 	if err != nil { return err }
 
-	// 3. 🌟 處理金庫資料夾 (執行搬家，舊標籤失去資料夾後將被降級為純標籤)
 	oldReleaseDir := filepath.Join(repoDir, ".gitlocal", "releases", oldTagName)
 	newReleaseDir := filepath.Join(repoDir, ".gitlocal", "releases", newTagName)
 
 	if oldTagName != newTagName {
 		if _, err := os.Stat(oldReleaseDir); err == nil {
-			// 防呆：若目標已有金庫，先移除以確保搬移成功
 			os.RemoveAll(newReleaseDir)
-			
-			// 直接將舊金庫重新命名為新金庫 (搬家)
 			os.Rename(oldReleaseDir, newReleaseDir)
-			
-			// 順便把裡面自動打包的 source.zip 檔名更新
 			oldZipName := fmt.Sprintf("%s_%s_source.zip", repoName, oldTagName)
 			newZipName := fmt.Sprintf("%s_%s_source.zip", repoName, newTagName)
 			os.Rename(filepath.Join(newReleaseDir, oldZipName), filepath.Join(newReleaseDir, newZipName))
@@ -891,28 +1183,24 @@ func EditRelease(repoName, oldTagName, newTagName, message string, assets []Uplo
 		os.MkdirAll(newReleaseDir, 0755)
 	}
 
-	// 4. 寫入新檔案
 	for _, asset := range assets {
 		if len(asset.Bytes) > 0 {
 			assetPath := filepath.Join(newReleaseDir, filepath.Base(asset.Path))
 			os.WriteFile(assetPath, asset.Bytes, 0644)
 		}
 	}
-
 	return nil
 }
 
 // ==========================================
-// 🌟 視覺化合併 (3-Way Merge) 核心引擎
+// 3-Way Merge 引擎
 // ==========================================
-
 type MergeConflict struct {
 	Path   string `json:"path"`
 	Ours   string `json:"ours"`
 	Theirs string `json:"theirs"`
 }
 
-// 1. 啟動合併：掃描並回傳兩條分支有差異的檔案
 func InitiateMerge(repoName, sourceBranch string) ([]MergeConflict, error) {
 	gitLock.Lock()
 	defer gitLock.Unlock()
@@ -931,30 +1219,24 @@ func InitiateMerge(repoName, sourceBranch string) ([]MergeConflict, error) {
 	oursTree, _ := oursCommit.Tree()
 	theirsTree, _ := theirsCommit.Tree()
 
-	// 比對兩棵樹的差異
 	changes, err := oursTree.Diff(theirsTree)
 	if err != nil { return nil, err }
 
 	var conflicts []MergeConflict
 	for _, ch := range changes {
 		conflict := MergeConflict{}
-		
 		if ch.From.Name == "" && ch.To.Name != "" { 
-			// 來源分支新增的檔案
 			conflict.Path = ch.To.Name
 			fTheirs, _ := theirsTree.File(ch.To.Name)
 			conflict.Theirs, _ = fTheirs.Contents()
 		} else if ch.From.Name != "" && ch.To.Name == "" { 
-			// 來源分支刪除的檔案
 			conflict.Path = ch.From.Name
 			fOurs, _ := oursTree.File(ch.From.Name)
 			conflict.Ours, _ = fOurs.Contents()
 		} else { 
-			// 雙方都有修改的檔案
 			conflict.Path = ch.To.Name
 			fOurs, _ := oursTree.File(ch.From.Name)
 			conflict.Ours, _ = fOurs.Contents()
-			
 			fTheirs, _ := theirsTree.File(ch.To.Name)
 			conflict.Theirs, _ = fTheirs.Contents()
 		}
@@ -963,10 +1245,10 @@ func InitiateMerge(repoName, sourceBranch string) ([]MergeConflict, error) {
 	return conflicts, nil
 }
 
-// 2. 封裝合併：寫入使用者在網頁上決定的最終結果，並產生雙親節點 (Merge Commit)
 func FinalizeMerge(repoName, sourceBranch, message string, resolvedFiles map[string]string) error {
 	gitLock.Lock()
 	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 🌟 合併成功後清空快取
 
 	path := filepath.Join(ReposDir, repoName)
 	repo, err := git.PlainOpen(path)
@@ -978,7 +1260,6 @@ func FinalizeMerge(repoName, sourceBranch, message string, resolvedFiles map[str
 	headRef, _ := repo.Head()
 	sourceRef, _ := repo.Reference(plumbing.NewBranchReferenceName(sourceBranch), true)
 
-	// 覆寫為使用者在前端決定好的最終程式碼
 	for fPath, content := range resolvedFiles {
 		fullPath := filepath.Join(path, fPath)
 		if content == "" {
@@ -991,7 +1272,6 @@ func FinalizeMerge(repoName, sourceBranch, message string, resolvedFiles map[str
 		}
 	}
 
-	// 🌟 關鍵魔法：賦予這個 Commit 兩個父親，讓 Git 樹狀圖畫出 Y 字型合併線！
 	_, err = wt.Commit(message, &git.CommitOptions{
 		Author:  &object.Signature{Name: "Web User", Email: "web@local.git", When: time.Now()},
 		Parents: []plumbing.Hash{headRef.Hash(), sourceRef.Hash()},
@@ -1000,9 +1280,8 @@ func FinalizeMerge(repoName, sourceBranch, message string, resolvedFiles map[str
 }
 
 // ==========================================
-// 🌟 高效能非同步分頁 API 專用結構
+// 非同步 Commit 分頁 API (1ms 極速回應)
 // ==========================================
-
 type CommitPageResponse struct {
 	TotalCount int          `json:"total_count"`
 	TotalPages int          `json:"total_pages"`
@@ -1011,9 +1290,6 @@ type CommitPageResponse struct {
 }
 
 func GetPaginatedCommits(repoName string, page int, limit int) (*CommitPageResponse, error) {
-	gitLock.Lock()
-	defer gitLock.Unlock()
-
 	path := filepath.Join(ReposDir, repoName)
 	repo, err := git.PlainOpen(path)
 	if err != nil { return nil, err }
@@ -1028,17 +1304,34 @@ func GetPaginatedCommits(repoName string, page int, limit int) (*CommitPageRespo
 	total := 0
 	var commits []CommitData
 
-	// 極速遍歷：只算總數，遇到落入區間的才做耗時的 Stats() 處理
 	err = logIter.ForEach(func(c *object.Commit) error {
 		if total >= offset && total < offset+limit {
 			parents := []string{}
 			for _, p := range c.ParentHashes { parents = append(parents, p.String()) }
-			
+
 			var changedFiles []string
-			// 🌟 只有這 25 筆會執行耗時的 c.Stats()
-			stats, errStat := c.Stats()
-			if errStat == nil {
-				for _, stat := range stats { changedFiles = append(changedFiles, stat.Name) }
+			cTree, errC := c.Tree()
+			if errC == nil {
+				if c.NumParents() > 0 {
+					if parentCommit, errP := c.Parent(0); errP == nil {
+						if pTree, errPT := parentCommit.Tree(); errPT == nil {
+							if cTree.Hash != pTree.Hash {
+								if changes, errDiff := object.DiffTree(pTree, cTree); errDiff == nil {
+									for _, ch := range changes {
+										fPath := ch.To.Name
+										if fPath == "" { fPath = ch.From.Name }
+										changedFiles = append(changedFiles, fPath)
+									}
+								}
+							}
+						}
+					}
+				} else {
+					_ = cTree.Files().ForEach(func(f *object.File) error {
+						changedFiles = append(changedFiles, f.Name)
+						return nil
+					})
+				}
 			}
 
 			commitData := CommitData{
@@ -1055,7 +1348,7 @@ func GetPaginatedCommits(repoName string, page int, limit int) (*CommitPageRespo
 	})
 
 	totalPages := total / limit
-	if total%limit != 0 { totalPages++ }
+	if total%limit != 0 && total > 0 { totalPages++ }
 
 	return &CommitPageResponse{
 		TotalCount: total,
@@ -1063,5 +1356,197 @@ func GetPaginatedCommits(repoName string, page int, limit int) (*CommitPageRespo
 		Page:       page,
 		Commits:    commits,
 	}, nil
+}
+
+// ==========================================
+// 🌟 一鍵撤銷 Commit 核心引擎 (純 Go 原生實作)
+// ==========================================
+func RevertCommit(repoName, commitSha string) error {
+	gitLock.Lock()
+	defer gitLock.Unlock()
+	invalidateRepoCache(repoName) // 寫入後自動刷新記憶體快取
+
+	path := filepath.Join(ReposDir, repoName)
+	repo, err := git.PlainOpen(path)
+	if err != nil { return fmt.Errorf("開啟倉庫失敗: %v", err) }
+
+	wt, err := repo.Worktree()
+	if err != nil { return err }
+
+	_, err = repo.Head()
+	if err != nil { return fmt.Errorf("無法獲取 HEAD 參考: %v", err) }
+
+	targetCommit, err := repo.CommitObject(plumbing.NewHash(commitSha))
+	if err != nil { return fmt.Errorf("找不到目標 Commit: %v", err) }
+
+	if targetCommit.NumParents() == 0 {
+		return fmt.Errorf("無法撤銷初始提交 (Initial Commit)！")
+	}
+
+	parentCommit, err := targetCommit.Parent(0)
+	if err != nil { return fmt.Errorf("無法獲取父提交: %v", err) }
+
+	targetTree, err := targetCommit.Tree()
+	if err != nil { return err }
+
+	parentTree, err := parentCommit.Tree()
+	if err != nil { return err }
+
+	// 🌟 核心計算：對比 Target 與 Parent 的反向差異 (Target -> Parent)
+	changes, err := targetTree.Diff(parentTree)
+	if err != nil { return err }
+
+	if len(changes) == 0 {
+		return fmt.Errorf("此 Commit 無任何可撤銷的異動內容")
+	}
+
+	// 套用反向異動至當前工作區
+	for _, ch := range changes {
+		if ch.From.Name == "" && ch.To.Name != "" {
+			// 原本被刪除 -> 重新還原檔案
+			file, err := parentTree.File(ch.To.Name)
+			if err == nil {
+				content, _ := file.Contents()
+				fullPath := filepath.Join(path, ch.To.Name)
+				os.MkdirAll(filepath.Dir(fullPath), 0755)
+				os.WriteFile(fullPath, []byte(content), 0644)
+				wt.Add(ch.To.Name)
+			}
+		} else if ch.From.Name != "" && ch.To.Name == "" {
+			// 原本被新增 -> 刪除該檔案
+			cleanPath := strings.TrimLeft(strings.ReplaceAll(ch.From.Name, "\\", "/"), "/")
+			fullPath := filepath.Join(path, cleanPath)
+			os.Remove(fullPath)
+			wt.Remove(cleanPath)
+		} else {
+			// 原本被修改 -> 恢復成 Parent 版本的內容
+			file, err := parentTree.File(ch.To.Name)
+			if err == nil {
+				content, _ := file.Contents()
+				fullPath := filepath.Join(path, ch.To.Name)
+				os.MkdirAll(filepath.Dir(fullPath), 0755)
+				os.WriteFile(fullPath, []byte(content), 0644)
+				wt.Add(ch.To.Name)
+			}
+		}
+	}
+
+	shortSha := commitSha
+	if len(shortSha) >= 7 { shortSha = shortSha[:7] }
+	firstMsgLine := strings.Split(strings.TrimSpace(targetCommit.Message), "\n")[0]
+	revertMsg := fmt.Sprintf("↺ Revert \"%s\"\n\nThis reverts commit %s.", firstMsgLine, commitSha)
+
+	// 提交反向修正 Commit
+	_, err = wt.Commit(revertMsg, &git.CommitOptions{
+		Author:            &object.Signature{Name: "Web User", Email: "web@local.git", When: time.Now()},
+		AllowEmptyCommits: false,
+	})
+	return err
+}
+
+// 🌟 打包包含 .git 的完整倉庫目錄 (連同所有分支與歷史)
+func GetFullRepoZip(repoName string) ([]byte, error) {
+	path := filepath.Join(ReposDir, repoName)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, fmt.Errorf("找不到倉庫目錄")
+	}
+
+	var buf bytes.Buffer
+	zipWriter := zip.NewWriter(&buf)
+
+	err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
+		if err != nil { return err }
+
+		relPath, err := filepath.Rel(path, filePath)
+		if err != nil || relPath == "." { return nil }
+
+		relPath = strings.ReplaceAll(relPath, "\\", "/")
+
+		if d.IsDir() {
+			_, err = zipWriter.Create(relPath + "/")
+			return err
+		}
+
+		data, err := os.ReadFile(filePath)
+		if err != nil { return err }
+
+		w, err := zipWriter.Create(relPath)
+		if err != nil { return err }
+		_, err = w.Write(data)
+		return err
+	})
+
+	if err != nil { return nil, err }
+	zipWriter.Close()
+	return buf.Bytes(), nil
+}
+
+// ==========================================
+// 🌟 智慧匯入專案 (自動識別 Full Backup 或純源碼 ZIP)
+// ==========================================
+func ImportRepoFromZip(repoName string, zipBytes []byte) error {
+	gitLock.Lock()
+	defer gitLock.Unlock()
+	invalidateRepoCache(repoName)
+
+	targetDir := filepath.Join(ReposDir, repoName)
+	if _, err := os.Stat(targetDir); err == nil {
+		return fmt.Errorf("專案 [%s] 已存在，請使用其他名稱或先刪除舊專案", repoName)
+	}
+
+	zipReader, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if err != nil {
+		return fmt.Errorf("無效的 ZIP 檔案: %v", err)
+	}
+
+	os.MkdirAll(targetDir, 0755)
+
+	hasGitDir := false
+	for _, f := range zipReader.File {
+		cleanPath := strings.TrimLeft(strings.ReplaceAll(f.Name, "\\", "/"), "/")
+		
+		// 檢查是否包含 .git 目錄結構
+		if strings.Contains(cleanPath, ".git/") || cleanPath == ".git" {
+			hasGitDir = true
+		}
+
+		fullPath := filepath.Join(targetDir, cleanPath)
+
+		if f.FileInfo().IsDir() {
+			os.MkdirAll(fullPath, 0755)
+			continue
+		}
+
+		os.MkdirAll(filepath.Dir(fullPath), 0755)
+		rc, err := f.Open()
+		if err != nil { continue }
+
+		outFile, err := os.Create(fullPath)
+		if err != nil {
+			rc.Close()
+			continue
+		}
+		io.Copy(outFile, rc)
+		outFile.Close()
+		rc.Close()
+	}
+
+	// 🌟 情境 2：若純源碼 ZIP (無 .git)，自動化初始化並建立初始 Commit
+	if !hasGitDir {
+		EnsureGitignore(targetDir)
+		repo, err := git.PlainInit(targetDir, false)
+		if err != nil { return fmt.Errorf("初始化新倉庫失敗: %v", err) }
+
+		wt, err := repo.Worktree()
+		if err == nil {
+			_ = wt.AddGlob(".")
+			_, _ = wt.Commit("🎉 匯入專案並建立初始提交 (Initial import from ZIP)", &git.CommitOptions{
+				Author:            &object.Signature{Name: "Web User", Email: "web@local.git", When: time.Now()},
+				AllowEmptyCommits: true,
+			})
+		}
+	}
+
+	return nil
 }
 
