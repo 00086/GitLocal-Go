@@ -26,7 +26,7 @@
 
         /* 🌟 全局鎖定外層捲動，並套用 Flexbox 填滿視窗 */
         html, body { height: 100vh; overflow: hidden !important; margin: 0; }
-        body.container { display: flex; flex-direction: column; }
+        body.container-fluid { display: flex; flex-direction: column; }
         
         /* 確保上方元素 (導航列、上傳區、Staging 區) 不會被壓扁 */
         body > nav, #drop-zone, #staging-section { flex-shrink: 0; }
@@ -73,7 +73,7 @@
         ::-webkit-scrollbar-thumb:hover { background: #a8a8a8; }
 		
 		/* 🌟 新增：全域字體放大一級，並強制縮減表格列高 (緊湊模式) */
-        body.container { font-size: 1.1rem; }
+        body.container-fluid { font-size: 1.1rem; }
         .table > :not(caption) > * > * { padding: 0.35rem 0.5rem; vertical-align: middle; }
         .btn-sm { font-size: 0.95rem; padding: 0.15rem 0.5rem; } /* 讓按鈕也變緊湊 */
         
@@ -110,11 +110,11 @@
     </style>
 </head>
 
-<body class="container pt-3 pb-2">
+<body class="container-fluid pt-3 pb-2 px-3">
     <div class="d-flex align-items-center mb-3">
         <nav aria-label="breadcrumb" class="mb-0">
             <ol class="breadcrumb fs-5 mb-0">
-                <li class="breadcrumb-item"><a href="/" onclick="sessionStorage.removeItem('currentDir_{{ .repo_name }}')">首頁</a></li>
+                <li class="breadcrumb-item"><a href="/" target="_top" onclick="sessionStorage.removeItem('currentDir_{{ .repo_name }}')">首頁</a></li>
                 <li class="breadcrumb-item active fw-bold">
                     <a href="javascript:void(0);" onclick="goToRoot()" class="text-decoration-none text-body">{{ .repo_name }}</a>
                 </li>
@@ -132,6 +132,15 @@
             <button class="btn btn-sm btn-warning fw-bold text-nowrap ms-1 shadow-sm" onclick="mergeBranchPrompt()" title="將其他分支合併到目前的進度">🔄 合併</button>
             
 			<button class="btn btn-sm btn-primary ms-2 fw-bold text-nowrap shadow-sm" onclick="openPushModal()">☁️ Push</button>
+			
+			<a href="/repo/{{ .repo_name }}/download_full_backup" class="btn btn-sm btn-outline-dark fw-bold text-nowrap ms-1 shadow-sm" title="下載包含 .git 完整歷史與分支的備份包">💾 備份金庫</a>
+			
+			<!-- 🌟 新增：健康度與瘦身按鈕 -->
+			<span id="repo-size-badge" class="badge bg-light text-dark border ms-2 shadow-sm" style="font-size: 0.85rem;" title="目前 .git 歷史金庫硬碟大小">容量: 載入中...</span>
+			<button class="btn btn-sm btn-outline-secondary fw-bold text-nowrap ms-1 shadow-sm" onclick="triggerGitGC()" title="清理孤立物件並壓縮 .git 目錄">🧹 瘦身</button>
+
+			<!-- 🌟 新增：Web 終端機按鈕 -->
+			<button class="btn btn-sm btn-dark ms-2 fw-bold text-nowrap shadow-sm" onclick="toggleTerminalDrawer()">🖥️ 終端機</button>
 			
             <button class="btn btn-sm btn-outline-secondary ms-2 fw-bold d-flex align-items-center" onclick="toggleTheme()" title="切換深淺模式">
                 <span id="theme-icon" style="font-size: 1.1rem; line-height: 1;">🌙</span>
@@ -466,6 +475,25 @@
             </div>
         </div>
     </div>
+	
+	<!-- 🌟 新增：底部折疊 Web Terminal 終端機視窗 -->
+	<div id="terminal-drawer" style="display:none; fixed:bottom; z-index:1030; background:#1e1e1e; color:#00ff66; border-top:2px solid #0d6efd; font-family: monospace; padding:10px 15px; box-shadow:0 -0.5rem 1rem rgba(0,0,0,0.3);">
+		<div class="d-flex justify-content-between align-items-center mb-2 pb-1 border-bottom border-secondary">
+			<div class="d-flex align-items-center gap-2">
+				<span class="fw-bold text-light">🖥️ GitLocal Web Terminal</span>
+				<span class="badge bg-dark text-warning border border-secondary font-monospace fw-normal" style="font-size: 0.8rem;">
+					📂 比對基準：[開發工作區] ➔ 📦 目標金庫: my_git_repos/{{ .repo_name }}
+				</span>
+			</div>
+			<button type="button" class="btn-close btn-close-white btn-sm" onclick="toggleTerminalDrawer()"></button>
+		</div>
+		<pre id="terminal-output" style="height: 120px; overflow-y: auto; background: #000; padding: 8px; border-radius: 4px; color: #00ff66; margin-bottom: 8px; font-size: 0.9rem; white-space: pre-wrap;"></pre>
+		<div class="input-group input-group-sm">
+			<span class="input-group-text bg-dark text-warning border-secondary font-monospace">$</span>
+			<input type="text" id="terminal-input" class="form-control bg-dark text-light border-secondary font-monospace" placeholder="輸入 Git 指令 (例如: git status 或 git log --oneline -n 5)..." onkeydown="if(event.key==='Enter') sendTerminalCommand()">
+			<button class="btn btn-primary fw-bold" onclick="sendTerminalCommand()">執行</button>
+		</div>
+	</div>
 
 </body>
 </html>
@@ -473,9 +501,9 @@
 <script>
 	const files = {{ .filesJson }};
 	const commits = {{ .commitsJson }};
-	const graph_commits = {{ .graphCommitsJson }}; 
+	let graph_commits = {{ .graphCommitsJson }}; 
 	const repoName = "{{ .repo_name }}";
-	const branches = {{ .branchesJson }};
+	let branches = {{ .branchesJson }};
 	const releases = {{ .releasesJson }}; // 🌟 新增這行接收 Release 資料
 	
 	// ==========================================
@@ -1010,37 +1038,20 @@
 		});
 		
 		filesInDir.forEach(item => {
-			let cleanMsg = item.message || '無 Commit 說明';
-			if (item.path && cleanMsg.includes(item.path)) {
-				cleanMsg = cleanMsg.replace(item.path, item.displayName);
-			}
-
-			let sha = item.hexsha || item.commit_id || item.id || item.hash;
-			if (!sha && commits && commits.length > 0) {
-				let matched = commits.find(c => c.time === item.time && c.message === item.message);
-				if (!matched) {
-					matched = commits.find(c => c.message && item.message && (c.message.trim() === item.message.trim() || c.message.includes(item.message.trim())));
-				}
-				if (matched) sha = matched.hexsha || matched.id || matched.hash;
-			}
+			let cleanMsg = item.message || '';
+			let sha = item.hexsha || '';
 			
-			let shortSha = sha ? sha.substring(0, 7) : "";
-			let shaBadge = shortSha 
-				? `<a href="javascript:void(0);" onclick="openCommitModal('${sha}')" class="font-monospace text-secondary text-decoration-none me-2 p-1 bg-light border rounded" style="font-size: 0.85em;">${shortSha}</a>` 
-				: '';
+			// 🌟 1. 如果資料庫尚未回傳 Last Commit 資訊，預設顯示淡灰色載入中文字
+			let shaBadge = sha ? `<a href="javascript:void(0);" onclick="openCommitModal('${sha}')" class="font-monospace text-secondary text-decoration-none me-2 p-1 bg-light border rounded" style="font-size: 0.85em;">${sha.substring(0, 7)}</a>` : '';
+			let commitHtml = cleanMsg 
+				? `<a href="javascript:void(0);" onclick="openCommitModal('${sha}')" class="text-body text-decoration-none commit-link">${cleanMsg.split('\n')[0]}</a>` 
+				: `<span class="text-muted small">⏳ 讀取 Commit 中...</span>`;
 
-			let firstLineMsg = cleanMsg.split('\n')[0];
-			
-			// 🌟 修正 1：使用 encodeURIComponent 徹底解決特殊符號與換行造成的 HTML 崩潰
+			let firstLineMsg = cleanMsg ? cleanMsg.split('\n')[0] : '';
 			let badgeHtml = cleanMsg.includes('\n') 
                 ? `<span class="badge bg-light text-secondary border ms-1 flex-shrink-0" style="cursor:pointer;" data-msg="${encodeURIComponent(cleanMsg)}" onclick="event.stopPropagation(); openMessageModal(decodeURIComponent(this.getAttribute('data-msg')))" title="點擊閱讀詳細備註">...</span>` 
                 : '';
 
-			let commitHtml = sha 
-				? `<a href="javascript:void(0);" onclick="openCommitModal('${sha}')" class="text-body text-decoration-none commit-link">${firstLineMsg}</a>` 
-				: `<span class="text-muted">${firstLineMsg}</span>`;
-
-			// 🌟 修正 2：導入 Flexbox (d-flex)，確保文字過長時只截斷文字，保留最右側的「...」按鈕
 			tbody.innerHTML += `<tr draggable="true" ondragstart="handleMoveDragStart(event, '${item.path}')" style="cursor: grab;">
 				<td style="width: 30%;" class="align-middle"><a href="/repo/${repoName}/file/${item.path}" class="text-decoration-none fw-semibold">📄 ${item.displayName}</a></td>
 				<td style="width: 40%; max-width: 0;" class="align-middle">
@@ -1050,7 +1061,7 @@
 						${badgeHtml}
 					</div>
 				</td>
-				<td style="width: 20%;" class="align-middle"><small class="text-muted">${item.time || ''}</small></td>
+				<td style="width: 20%;" class="align-middle"><small class="text-muted">${calcDynamicRelativeTime(item.time) || ''}</small></td>
 				<td class="text-end text-nowrap" style="width: 10%;">
 					<button class="btn btn-sm btn-outline-primary border-0 me-1" onclick="promptRename('${item.path}', '${item.displayName}')" title="改名或移動路徑">✏️</button>
 					<form action="/repo/${repoName}/delete/${item.path}" method="POST" style="margin: 0; display: inline-block;">
@@ -1200,15 +1211,28 @@
 	// --- 🌟 Git Graph 視覺化模組 ---
 	let isGraphRendered = false;
 
-	// --- Git Graph Modal 控制邏輯 ---
-	function openGitGraphModal() {
+	// 🌟 點擊時極速非同步繪製 Git 樹狀圖 (5ms)
+	async function openGitGraphModal() {
 		const modal = document.getElementById('gitGraphModal');
-		modal.style.display = 'flex'; // 顯示 Popup
+		modal.style.display = 'flex';
 		
-		// 只有第一次開啟時才繪製圖表，節省效能
-		if (!isGraphRendered) {
+		const graphContainer = document.getElementById("gitgraph");
+		graphContainer.innerHTML = '<div class="text-center py-5 text-muted"><div class="spinner-border text-info mb-2"></div><div class="fw-bold">解析 Git 血統樹中...</div></div>';
+		
+		try {
+			const res = await fetch(`/api/repo/${repoName}/git-graph?t=${Date.now()}`);
+			const data = await res.json();
+			
+			graph_commits = data.graph_commits || [];
+			
+			if (data.branches) {
+				branches = data.branches;
+				renderBranches();
+			}
+			
 			renderGitGraph();
-			isGraphRendered = true;
+		} catch (e) {
+			graphContainer.innerHTML = '<div class="text-danger p-4 text-center">無法載入 Git 樹狀圖資料</div>';
 		}
 	}
 
@@ -2110,7 +2134,7 @@
 	// 🌟 非同步分頁載入 Commit 歷史紀錄
 	// ==========================================
 	let currentCommitPage = 1;
-	const commitsPerPage = 25;
+	const commitsPerPage = 10; // 🌟 改為每頁 10 筆，大幅減少 DOM 繪製與資料傳輸負擔
 
 	async function fetchAndRenderCommits(page = 1) {
 		const tbody = document.getElementById('commit-table-body');
@@ -2145,6 +2169,7 @@
 			}
 
 			// 渲染表格內容
+			// 渲染表格內容
 			data.commits.forEach(item => {
 				let fileHTML = '<small class="text-muted">-</small>';
 				if (item.files && item.files.length > 0) {
@@ -2155,17 +2180,20 @@
 					fileHTML = fileLinks.join(' ');
 				}
 				
+				// 🌟 關鍵修復：先宣告並計算 firstLineMsg，避免宣告前存取的錯位問題
+				const firstLineMsg = item.message.split('\n')[0];
+
 				const zipBtn = `<a href="/repo/${repoName}/download_zip/${item.hexsha}" class="btn btn-sm btn-outline-dark px-2 py-0" title="下載此時間點的完整專案">📦 ZIP</a>`;
 				const branchBtn = `<button onclick="createBranchFromCommit('${item.hexsha}')" class="btn btn-sm btn-outline-success px-2 py-0 ms-1" title="從這個歷史時間點建立新分支">🌱 分支</button>`;
+				const revertBtn = `<button onclick="revertCommitPrompt('${item.hexsha}', '${encodeURIComponent(firstLineMsg)}')" class="btn btn-sm btn-outline-warning px-2 py-0 ms-1" title="撤銷此 Commit 造成的變更">↺ 撤銷</button>`;
 
-				const firstLineMsg = item.message.split('\n')[0];
 				const badgeHtml = item.message.includes('\n') ? `<span class="badge bg-light text-secondary border ms-1 flex-shrink-0" style="cursor:pointer;" data-msg="${encodeURIComponent(item.message)}" onclick="event.stopPropagation(); openMessageModal(decodeURIComponent(this.getAttribute('data-msg')))" title="點擊閱讀詳細備註">...</span>` : '';
 
 				tbody.innerHTML += `
 					<tr>
 						<td class="align-middle text-nowrap">
 							<a href="javascript:void(0);" onclick="openCommitModal('${item.hexsha}')" class="font-monospace fw-bold text-decoration-none me-2">${item.hexsha.substring(0, 7)}</a>
-							${zipBtn} ${branchBtn}
+							${zipBtn} ${branchBtn} ${revertBtn}
 						</td>
 						<td class="align-middle">${fileHTML}</td>
 						<td class="align-middle" style="max-width: 300px;">
@@ -2174,7 +2202,7 @@
 								${badgeHtml}
 							</div>
 						</td>
-						<td class="align-middle"><small class="text-muted">${item.time}</small></td>
+						<td class="align-middle"><small class="text-muted">${calcDynamicRelativeTime(item.time) || ''}</small></td>
 					</tr>`;
 			});
 
@@ -2241,6 +2269,178 @@
 			'dockerfile': 'dockerfile' // 🐳 順便支援 Dockerfile
 		};
 		return langMap[ext] || 'plaintext';
+	}
+	
+	// 🌟 新增：背景異步補抓檔案 Last Commit 資訊 (GitHub 模式)
+	async function fetchFileCommitsAsync() {
+		try {
+			// 🌟 加入 ?t=${Date.now()} 強制獲取當前最新 commit
+			const res = await fetch(`/api/repo/${repoName}/file-commits?t=${Date.now()}`);
+			if (!res.ok) return;
+			const updatedFiles = await res.json();
+			
+			if (updatedFiles && updatedFiles.length > 0) {
+				updatedFiles.forEach(uf => {
+					let match = files.find(f => f.path === uf.path);
+					if (match) {
+						match.message = uf.message;
+						match.time = uf.time;
+						match.hexsha = uf.hexsha;
+					}
+				});
+				renderFileTree();
+			}
+		} catch (e) {
+			console.warn("背景讀取檔案 Commit 失敗:", e);
+		}
+	}
+	
+	document.addEventListener('DOMContentLoaded', () => { 
+		const currentTheme = document.documentElement.getAttribute('data-bs-theme');
+		updateThemeIcon(currentTheme);
+		document.getElementById('markdown-css').href = `https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-${currentTheme === 'dark' ? 'dark' : 'light'}.min.css`;
+
+		// 🌟 1. 0ms 瞬間渲染完整的檔案與 README
+		renderFileTree(); 
+		
+		// 🌟 2. 非同步請求 10 筆歷史 Commit 分頁 (1ms 完成)
+		fetchAndRenderCommits(1); 
+		
+		renderBranches(); 
+		renderReleases(); 
+	});
+	
+	// 🌟 新增：載入倉庫容量診斷資訊
+	async function fetchRepoHealth() {
+		try {
+			const res = await fetch(`/api/repo/${repoName}/health`);
+			const data = await res.json();
+			if (data.git_dir_size) {
+				document.getElementById('repo-size-badge').innerText = `容量: ${data.git_dir_size}`;
+			}
+		} catch (e) {}
+	}
+
+	// 🌟 新增：一鍵 GC 瘦身
+	async function triggerGitGC() {
+		const badge = document.getElementById('repo-size-badge');
+		badge.innerText = "⏳ 瘦身中...";
+		try {
+			const res = await fetch(`/api/repo/${repoName}/gc`, { method: 'POST' });
+			const data = await res.json();
+			if (res.ok) {
+				alert("🎉 " + data.message);
+				fetchRepoHealth();
+			} else {
+				alert("❌ " + (data.error || "瘦身失敗"));
+			}
+		} catch (e) {
+			alert("❌ 網路連線錯誤");
+		}
+	}
+
+	// 🌟 新增：Web Terminal 控制邏輯
+	function toggleTerminalDrawer() {
+		const drawer = document.getElementById('terminal-drawer');
+		if (drawer.style.display === 'none') {
+			drawer.style.display = 'block';
+			document.getElementById('terminal-input').focus();
+		} else {
+			drawer.style.display = 'none';
+		}
+	}
+	
+	// 🌟 新增：將 ANSI 顏色控制碼轉換為彩色 HTML (解決 [32m 亂碼並呈現綠色高亮)
+	function parseAnsiToHtml(str) {
+		if (!str) return '';
+		return str
+			.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+			.replace(/\x1b\[32m|\033\[32m|\[32m/g, '<span style="color: #00ff66; font-weight: bold;">')
+			.replace(/\x1b\[31m|\033\[31m|\[31m/g, '<span style="color: #ff4d4d; font-weight: bold;">')
+			.replace(/\x1b\[33m|\033\[33m|\[33m/g, '<span style="color: #ffcc00; font-weight: bold;">')
+			.replace(/\x1b\[0m|\033\[0m|\[0m/g, '</span>');
+	}
+
+	async function sendTerminalCommand() {
+		const input = document.getElementById('terminal-input');
+		const output = document.getElementById('terminal-output');
+		const cmd = input.value.trim();
+		if (!cmd) return;
+
+		// 1. 印出使用者剛剛輸入的指令
+		output.innerHTML += `<div class="text-warning">$ ${parseAnsiToHtml(cmd)}</div>`;
+		input.value = '';
+
+		// 2. 正確建立表單資料
+		const formData = new FormData();
+		formData.append("command", cmd);
+
+		// 3. 發送請求至後端 API
+		try {
+			const res = await fetch(`/api/repo/${repoName}/terminal`, { method: 'POST', body: formData });
+			const data = await res.json();
+
+			if (res.ok) {
+				output.innerHTML += `<div>${parseAnsiToHtml(data.output) || '(無輸出結果)'}</div>`;
+			} else {
+				output.innerHTML += `<div class="text-danger">❌ ${parseAnsiToHtml(data.error)}</div>`;
+			}
+		} catch (e) {
+			output.innerHTML += `<div class="text-danger">❌ 網路發送錯誤: ${e}</div>`;
+		}
+		
+		// 4. 自動捲動至終端機最底部
+		output.scrollTop = output.scrollHeight;
+	}
+
+	// 網頁載入完成時，順便抓取健康容量
+	document.addEventListener('DOMContentLoaded', fetchRepoHealth);
+	
+	// 🌟 新增：瀏覽器前端即時動態計算相對時間 (不受 RAM 快取影響)
+	function calcDynamicRelativeTime(exactTimeStr) {
+		if (!exactTimeStr) return '';
+		if (exactTimeStr.includes('前 (')) return exactTimeStr; // 舊資料防呆
+
+		const commitTime = new Date(exactTimeStr.replace(/-/g, '/'));
+		if (isNaN(commitTime.getTime())) return exactTimeStr;
+
+		const diffSec = Math.floor((new Date() - commitTime) / 1000);
+		let timeAgo = "";
+
+		if (diffSec >= 86400) {
+			const days = Math.floor(diffSec / 86400);
+			timeAgo = `${days} 天前`;
+		} else if (diffSec >= 3600) {
+			const hours = Math.floor(diffSec / 3600);
+			timeAgo = `${hours} 小時前`;
+		} else if (diffSec >= 60) {
+			const minutes = Math.floor(diffSec / 60);
+			timeAgo = `${minutes} 分鐘前`;
+		} else {
+			const seconds = Math.max(0, diffSec);
+			timeAgo = `${seconds} 秒前`;
+		}
+
+		return `${timeAgo} (${exactTimeStr})`;
+	}
+	
+	// 🌟 新增：一鍵撤銷 Commit 觸發對話框
+	async function revertCommitPrompt(sha, encodedMsg) {
+		const msg = decodeURIComponent(encodedMsg);
+		if (confirm(`⚠️ 確定要撤銷 Commit [${sha.substring(0, 7)}]\n「${msg}」造成的變更嗎？\n\n系統將會自動產生一個反向修復的 Commit！`)) {
+			try {
+				const response = await fetch(`/repo/${repoName}/revert/${sha}`, { method: 'POST' });
+				if (response.ok) {
+					alert("🎉 撤銷成功！已建立反向修復提交。");
+					location.reload();
+				} else {
+					const errText = await response.text();
+					alert(`❌ 撤銷失敗: \n${errText}`);
+				}
+			} catch (e) {
+				alert(`❌ 系統連線錯誤: ${e}`);
+			}
+		}
 	}
 
 </script>

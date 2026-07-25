@@ -6,6 +6,11 @@
     <script>
         const savedTheme = localStorage.getItem('gitlocal_theme') || 'light';
         document.documentElement.setAttribute('data-bs-theme', savedTheme);
+        
+        // 🌟 1. 核心防閃爍：在 DOM 繪製前的 0 毫秒瞬間鎖定 iframe 狀態！
+        if (window.self !== window.top) {
+            document.documentElement.classList.add('in-iframe');
+        }
     </script>
 
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
@@ -17,96 +22,77 @@
 
     <style>
         html, body { height: 100vh; overflow: hidden !important; margin: 0; }
-        body.container { display: flex; flex-direction: column; max-width: 100%; padding-top: 1rem; padding-bottom: 1rem; }
+        body.container-fluid { display: flex; flex-direction: column; max-width: 100%; padding: 1rem; }
         nav, .header-controls { flex-shrink: 0; }
-        #edit-form { flex: 1; display: flex; flex-direction: column; min-height: 0; margin-bottom: 0; }
         
-        /* 🌟 1. 為所有編輯/預覽容器加上 min-height: 0，防止長內容撐爆高度 */
-        #editor-container, #preview-container, #image-container { 
-            flex: 1; min-height: 0; position: relative; margin-bottom: 1rem; 
-        }
+        /* 🌟 IDE 雙欄核心架構 (死鎖 280px 寬度) */
+        #ide-wrapper { flex: 1; display: flex; min-height: 0; gap: 1rem; }
         
-        /* 🌟 2. 讓 #preview-container 成為 Flex 縱向容器 */
-        #preview-container {
-            display: flex;
-            flex-direction: column;
-        }
+        #sidebar { width: 280px; flex-shrink: 0; display: flex; flex-direction: column; border-radius: 6px; border: 1px solid var(--bs-border-color); background: var(--bs-tertiary-bg); overflow: hidden; }
+        #sidebar-header { padding: 10px 15px; font-weight: bold; background: var(--bs-secondary-bg); border-bottom: 1px solid var(--bs-border-color); }
+        #tree-root { flex: 1; overflow-y: auto; padding: 10px 5px; font-size: 0.95rem; }
         
-        .engine-wrapper { 
-            position: absolute; top: 0; left: 0; right: 0; bottom: 0; 
-            display: flex; flex-direction: column; 
-            box-shadow: 0 .125rem .25rem rgba(0,0,0,.075); 
-            border-radius: 6px; overflow: hidden; 
-            border: 1px solid var(--bs-border-color); 
-            background: var(--bs-body-bg);
-        }
+        /* 🌟 防套娃 CSS：使用 html.in-iframe 在頁面渲染第 1 幀前徹底隱藏內層側邊欄 */
+        html.in-iframe #sidebar { display: none !important; }
+        html.in-iframe nav { margin-bottom: 0.5rem !important; }
+
+        /* GitHub 風格樹狀資料夾與檔案 */
+        .tree-folder-title { padding: 4px 8px; font-weight: 600; cursor: pointer; user-select: none; border-radius: 4px; font-size: 0.9rem; color: var(--bs-body-color); display: flex; align-items: center; }
+        .tree-folder-title:hover { background-color: rgba(13, 110, 253, 0.08); }
+        .folder-arrow { font-size: 0.75rem; width: 14px; display: inline-block; color: #888; }
+
+        .file-tree-item { display: block; padding: 4px 8px; border-radius: 4px; color: var(--bs-body-color); text-decoration: none; word-break: break-all; transition: background-color 0.1s; font-size: 0.88rem; }
+        .file-tree-item:hover { background-color: rgba(13, 110, 253, 0.1); text-decoration: none; color: var(--bs-body-color); }
+        .file-tree-item.active { background-color: rgba(13, 110, 253, 0.15); font-weight: bold; color: #0d6efd; border-left: 3px solid #0d6efd; }
+        [data-bs-theme="dark"] .file-tree-item.active { color: #79c0ff; border-left-color: #79c0ff; }
+
+        #edit-form { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+        
+        #editor-container, #preview-container, #image-container { flex: 1; min-height: 0; position: relative; margin-bottom: 1rem; }
+        #preview-container { display: flex; flex-direction: column; }
+        
+        .engine-wrapper { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; box-shadow: 0 .125rem .25rem rgba(0,0,0,.075); border-radius: 6px; overflow: hidden; border: 1px solid var(--bs-border-color); background: var(--bs-body-bg); }
         .engine-wrapper.d-none { display: none !important; }
         
         .cm-editor, .monaco-pane-wrapper { flex: 1; height: 100%; outline: none; }
         .cm-scroller { overflow: auto !important; font-family: 'Consolas', 'Courier New', monospace !important; }
         
-        /* 🌟 3. 確保 #preview-pane 在 Flex 容器內鎖死高度並開啟垂直捲軸 */
-        #preview-pane { 
-            flex: 1; 
-            min-height: 0; 
-            height: 100%; 
-            overflow-y: auto !important; 
-            border: 1px solid var(--bs-border-color); 
-            border-radius: 6px; 
-            padding: 30px; 
-            background-color: var(--bs-body-bg); 
-            color: var(--bs-body-color); 
-        }
+        #preview-pane { flex: 1; min-height: 0; height: 100%; overflow-y: auto !important; border: 1px solid var(--bs-border-color); border-radius: 6px; padding: 30px; background-color: var(--bs-body-bg); color: var(--bs-body-color); }
         .image-preview { max-width: 100%; max-height: 550px; border-radius: 6px; }
         .bg-checkered { background-image: linear-gradient(45deg, #f0f0f0 25%, transparent 25%), linear-gradient(-45deg, #f0f0f0 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #f0f0f0 75%), linear-gradient(-45deg, transparent 75%, #f0f0f0 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px; }
         [data-bs-theme="dark"] .bg-checkered { background-image: linear-gradient(45deg, #333 25%, transparent 25%), linear-gradient(-45deg, #333 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #333 75%), linear-gradient(-45deg, transparent 75%, #333 75%); }
 
-        /* ========================================== */
-        /* 🌟 EasyMDE 基礎版面 */
-        /* ========================================== */
+        /* EasyMDE 基礎版面 */
         #wrapper-easymde { display: flex; flex-direction: column; }
         #wrapper-easymde .EasyMDEContainer { display: flex; flex-direction: column; height: 100%; min-height: 0; }
         #wrapper-easymde .editor-statusbar { display: none !important; }
         #wrapper-easymde .CodeMirror-scroll { height: 100% !important; min-height: 100% !important; }
-        
         #wrapper-easymde .editor-toolbar { flex: 0 0 auto !important; border: none; border-bottom: 1px solid var(--bs-border-color); background: var(--bs-tertiary-bg); }
         #wrapper-easymde .editor-toolbar button { color: var(--bs-body-color) !important; }
         #wrapper-easymde .editor-toolbar button:hover, #wrapper-easymde .editor-toolbar button.active { background: var(--bs-secondary-bg) !important; border-color: transparent !important; }
         #wrapper-easymde .editor-toolbar i.separator { border-color: var(--bs-border-color) !important; border-right: none !important; margin: 0 4px; }
-        
-        #wrapper-easymde .CodeMirror { 
-            flex: 1 1 auto !important; height: 0 !important; min-height: 0 !important; border: none; 
-            font-family: 'Consolas', 'Courier New', monospace; font-size: 15px; 
-        }
+        #wrapper-easymde .CodeMirror { flex: 1 1 auto !important; height: 0 !important; min-height: 0 !important; border: none; font-family: 'Consolas', 'Courier New', monospace; font-size: 15px; }
 
-        /* ========================================== */
-        /* 🌟 深色主題統一修正 (背景與行數底色完全一致化) */
-        /* ========================================== */
+        /* 深色主題統一修正 */
         [data-bs-theme="dark"] .engine-wrapper { border-color: #3e3e42 !important; background: #1e1e1e !important; }
-        
-        /* 1. CM6 統一深色背景與行數底色 */
         [data-bs-theme="dark"] .cm-editor { background-color: #1e1e1e !important; }
         [data-bs-theme="dark"] .cm-gutters { background-color: #1e1e1e !important; border-right: 1px solid #333 !important; color: #858585 !important; }
-
-        /* 2. EasyMDE 工具列暗黑化 */
         [data-bs-theme="dark"] #wrapper-easymde .editor-toolbar { border-bottom: 1px solid #3e3e42 !important; background: #252526 !important; }
         [data-bs-theme="dark"] #wrapper-easymde .editor-toolbar button { color: #d4d4d4 !important; }
         [data-bs-theme="dark"] #wrapper-easymde .editor-toolbar button:hover, [data-bs-theme="dark"] #wrapper-easymde .editor-toolbar button.active { background: #3e3e42 !important; border-color: transparent !important; }
         [data-bs-theme="dark"] #wrapper-easymde .editor-toolbar i.separator { border-color: #444 !important; }
-        
-        /* 3. 覆寫 Darcula 預設的 2b2b2b 背景，對齊 Monaco 的 1e1e1e */
         [data-bs-theme="dark"] #wrapper-easymde .CodeMirror { background: #1e1e1e !important; }
         [data-bs-theme="dark"] #wrapper-easymde .CodeMirror-gutters { background-color: #1e1e1e !important; border-right: 1px solid #333 !important; }
         [data-bs-theme="dark"] #wrapper-easymde .CodeMirror-linenumber { color: #858585 !important; }
     </style>
 </head>
-<body class="container">
+<body class="container-fluid">
     <textarea id="raw-content-template" style="display:none;">{{ .content }}</textarea>
 
     <nav aria-label="breadcrumb" class="mb-3">
         <ol class="breadcrumb fs-5 mb-0">
-            <li class="breadcrumb-item"><a href="/" class="text-decoration-none">首頁</a></li>
-            <li class="breadcrumb-item"><a href="/repo/{{ .repo_name }}" class="text-decoration-none">{{ .repo_name }}</a></li>
+            <li class="breadcrumb-item"><a href="/" target="_top" class="text-decoration-none">首頁</a></li>
+            <li class="breadcrumb-item"><a href="/?repo={{ .repo_name }}" target="_top" class="text-decoration-none">{{ .repo_name }}</a></li>
             <li class="breadcrumb-item active fw-bold text-body">{{ .file_path }}</li>
         </ol>
     </nav>
@@ -146,38 +132,50 @@
         </div>
     </div>
 
-    <form action="/repo/{{ .repo_name }}/file/{{ .file_path }}" method="POST" id="edit-form" onsubmit="window.combineMessage(event)">
-        <div id="editor-container">
-            <div id="wrapper-codemirror" class="engine-wrapper"></div>
-            <div id="wrapper-monaco" class="engine-wrapper d-none"></div>
-            <div id="wrapper-easymde" class="engine-wrapper d-none">
-                <textarea id="easymde-textarea"></textarea>
-            </div>
-        </div>
+    <!-- IDE 雙欄外框 -->
+    <div id="ide-wrapper">
         
-        <div id="preview-container" class="d-none">
-            <div id="preview-pane" class="markdown-body shadow-sm"></div>
+        <!-- 左側檔案樹 (獨立開啟時顯示，被嵌入 Iframe 時 0 毫秒無縫隱藏) -->
+        <div id="sidebar" class="shadow-sm">
+            <div id="sidebar-header" class="text-secondary">📁 專案檔案 ({{ .repo_name }})</div>
+            <div id="tree-root"></div>
         </div>
 
-        <div id="image-container" class="d-none text-center p-4 border rounded shadow-sm bg-checkered">
-            <img id="image-viewer" class="image-preview shadow" src="">
-            <div class="mt-3 text-muted fw-bold bg-white d-inline-block px-3 py-1 rounded border">這是圖片檔案，無法進行文字編輯。</div>
-        </div>
-
-        <div id="action-bar" class="card p-3 shadow-sm border-primary border-opacity-50">
-            <div class="row align-items-stretch g-2">
-                <div class="col-md-9 d-flex flex-column gap-2">
-                    <input type="text" id="commit_title" class="form-control border-primary border-opacity-25" placeholder="請輸入 Commit 標題 (預設: Update {{ .file_path }})" value="Update {{ .file_path }}" required>
-                    <textarea id="commit_body" class="form-control border-primary border-opacity-25" rows="1" placeholder="詳細備註 (可選)"></textarea>
-                </div>
-                <div class="col-md-3 d-flex">
-                    <button type="submit" class="btn btn-primary w-100 fw-bold shadow-sm">💾 儲存並 Commit</button>
+        <!-- 右側編輯區 -->
+        <form action="/repo/{{ .repo_name }}/file/{{ .file_path }}" method="POST" id="edit-form" onsubmit="window.combineMessage(event)">
+            <div id="editor-container">
+                <div id="wrapper-codemirror" class="engine-wrapper"></div>
+                <div id="wrapper-monaco" class="engine-wrapper d-none"></div>
+                <div id="wrapper-easymde" class="engine-wrapper d-none">
+                    <textarea id="easymde-textarea"></textarea>
                 </div>
             </div>
-            <input type="hidden" name="content" id="hidden_content">
-            <input type="hidden" name="message" id="real_message">
-        </div>
-    </form>
+            
+            <div id="preview-container" class="d-none">
+                <div id="preview-pane" class="markdown-body shadow-sm"></div>
+            </div>
+
+            <div id="image-container" class="d-none text-center p-4 border rounded shadow-sm bg-checkered">
+                <img id="image-viewer" class="image-preview shadow" src="">
+                <div class="mt-3 text-muted fw-bold bg-white d-inline-block px-3 py-1 rounded border">這是圖片檔案，無法進行文字編輯。</div>
+            </div>
+
+            <div id="action-bar" class="card p-3 shadow-sm border-primary border-opacity-50 flex-shrink-0">
+                <div class="row align-items-stretch g-2">
+                    <div class="col-md-9 d-flex flex-column gap-2">
+                        <input type="text" id="commit_title" class="form-control border-primary border-opacity-25" placeholder="請輸入 Commit 標題 (預設: Update {{ .file_path }})" value="Update {{ .file_path }}" required>
+                        <textarea id="commit_body" class="form-control border-primary border-opacity-25" rows="1" placeholder="詳細備註 (可選)"></textarea>
+                    </div>
+                    <div class="col-md-3 d-flex">
+                        <button type="submit" class="btn btn-primary w-100 fw-bold shadow-sm">💾 儲存並 Commit</button>
+                    </div>
+                </div>
+                <input type="hidden" name="content" id="hidden_content">
+                <input type="hidden" name="message" id="real_message">
+            </div>
+        </form>
+        
+    </div>
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/easymde/dist/easymde.min.js"></script>
@@ -205,32 +203,116 @@
         const repoName = "{{ .repo_name }}";
         const ext = filePath.split('.').pop().toLowerCase();
         
-        // ==========================================
-        // 🌟 核心修正：攔截 Markdown 圖片，相容最新版 marked.js
-        // ==========================================
+        const projectFiles = {{ .filesJson }};
+
+        function buildFileTree(files) {
+            const root = { name: '', type: 'folder', children: {} };
+            files.forEach(f => {
+                const parts = f.path.split('/');
+                let current = root;
+                parts.forEach((part, index) => {
+                    const isFile = (index === parts.length - 1);
+                    if (!current.children[part]) {
+                        current.children[part] = {
+                            name: part,
+                            fullPath: parts.slice(0, index + 1).join('/'),
+                            type: isFile ? 'file' : 'folder',
+                            children: isFile ? null : {}
+                        };
+                    }
+                    if (!isFile) {
+                        current = current.children[part];
+                    }
+                });
+            });
+            return root;
+        }
+
+        function renderTreeHTML(node, level = 0) {
+            let html = '';
+            const childrenKeys = Object.keys(node.children || {}).sort((a, b) => {
+                const aIsFolder = node.children[a].type === 'folder';
+                const bIsFolder = node.children[b].type === 'folder';
+                if (aIsFolder && !bIsFolder) return -1;
+                if (!aIsFolder && bIsFolder) return 1;
+                return a.localeCompare(b);
+            });
+
+            childrenKeys.forEach(key => {
+                const child = node.children[key];
+                const indent = level * 12 + 6;
+                if (child.type === 'folder') {
+                    const folderId = `dir-${child.fullPath.replace(/[^a-zA-Z0-9]/g, '_')}`;
+                    html += `
+                        <div class="tree-folder-group">
+                            <div class="tree-folder-title" onclick="toggleFolderNode('${folderId}')" style="padding-left: ${indent}px">
+                                <span class="folder-arrow" id="arrow-${folderId}">▼</span>
+                                <span class="ms-1">📁 ${child.name}</span>
+                            </div>
+                            <div class="tree-folder-children" id="${folderId}">
+                                ${renderTreeHTML(child, level + 1)}
+                            </div>
+                        </div>`;
+                } else {
+                    const fileExt = child.name.split('.').pop().toLowerCase();
+                    const isImage = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(fileExt);
+                    const icon = isImage ? '🖼️' : '📄';
+                    const isActive = (child.fullPath === filePath) ? 'active' : '';
+
+                    html += `<a href="/repo/${repoName}/file/${child.fullPath}" class="file-tree-item ${isActive}" style="padding-left: ${indent + 14}px" title="${child.fullPath}">${icon} ${child.name}</a>`;
+                }
+            });
+            return html;
+        }
+
+        window.toggleFolderNode = function(folderId) {
+            const el = document.getElementById(folderId);
+            const arrow = document.getElementById(`arrow-${folderId}`);
+            if (el) {
+                if (el.style.display === 'none') {
+                    el.style.display = 'block';
+                    if (arrow) arrow.innerText = '▼';
+                } else {
+                    el.style.display = 'none';
+                    if (arrow) arrow.innerText = '▶';
+                }
+            }
+        };
+
+        function renderSidebarTree() {
+            const treeRoot = document.getElementById('tree-root');
+            if (!projectFiles || projectFiles.length === 0) return;
+
+            const treeData = buildFileTree(projectFiles);
+            treeRoot.innerHTML = renderTreeHTML(treeData);
+            
+            const activeEl = treeRoot.querySelector('.active');
+            if (activeEl) {
+                setTimeout(() => activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' }), 100);
+            }
+        }
+        
+        // 只有非 Iframe 獨立開啟時才渲染自己的側邊欄，節省效能
+        if (window.self === window.top) {
+            renderSidebarTree();
+        }
+
+        // Markdown 圖片攔截器
         marked.use({
             renderer: {
                 image(token) {
-                    // 防呆：相容新版 v12 (物件) 與舊版 (字串) 的參數傳遞
                     let href = typeof token === 'string' ? token : token.href;
                     let text = typeof token === 'string' ? arguments[2] : token.text;
                     let title = typeof token === 'string' ? arguments[1] : token.title;
 
-                    // 如果是相對路徑 (不以 http 或 data: 開頭)
                     if (href && !href.startsWith('http') && !href.startsWith('data:')) {
-                        // 去除開頭多餘的 ./ 或 /
                         let cleanHref = href.replace(/^\.\//, '').replace(/^\//, ''); 
-                        
-                        // 計算當前編輯的檔案所在的資料夾
                         const dirParts = filePath.split('/');
                         dirParts.pop(); 
                         const currentDir = dirParts.length > 0 ? dirParts.join('/') + '/' : '';
-                        
-                        // 組合成呼叫 Go 後端的真實取圖網址
                         href = `/repo/${repoName}/raw/${currentDir}${cleanHref}`;
                     }
                     
-                    // 回傳 Bootstrap 響應式圖片 HTML
                     let out = `<img src="${href}" alt="${text || ''}" style="max-width: 100%; height: auto; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);"`;
                     if (title) out += ` title="${title}"`;
                     out += '>';
@@ -238,7 +320,6 @@
                 }
             }
         });
-        // ==========================================
 
         const editorContainer = document.getElementById('editor-container');
         const previewContainer = document.getElementById('preview-container');
@@ -260,9 +341,7 @@
         document.getElementById('theme-icon').innerText = isDark ? '🌞' : '🌙';
         document.getElementById('markdown-css').href = `https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-${isDark ? 'dark' : 'light'}.min.css`;
 
-        // ==========================================
-        // 🌟 全域深淺色切換邏輯 (完美同步防錯亂)
-        // ==========================================
+        // 主題切換
         window.toggleTheme = function() {
             const currentTheme = document.documentElement.getAttribute('data-bs-theme');
             const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
@@ -270,22 +349,21 @@
             document.documentElement.setAttribute('data-bs-theme', newTheme);
             localStorage.setItem('gitlocal_theme', newTheme);
             document.getElementById('theme-icon').innerText = newTheme === 'dark' ? '🌞' : '🌙';
-            document.getElementById('markdown-css').href = `https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-${newTheme}.min.css`;
+            document.getElementById('markdown-css').href = `https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-${newTheme === 'dark' ? 'dark' : 'light'}.min.css`;
 
             if (monacoInstance) {
                 monaco.editor.setTheme(newTheme === 'dark' ? 'vs-dark' : 'vs');
             }
 
-            // 💡 關鍵修復：無論 CM6 目前是否顯示，都必須銷毀。確保下次顯示時帶有正確主題！
             if (cm6View) {
                 if (currentEngine === 'codemirror') {
-                    currentCode = cmViewGetCode(); // 先存檔
+                    currentCode = cmViewGetCode();
                     cm6View.destroy();
                     cm6View = null;
                     initCodeMirror6(currentCode);
                 } else {
                     cm6View.destroy();
-                    cm6View = null; // 在背景被銷毀，下次切換到它時會重新啟動
+                    cm6View = null; 
                 }
             }
 
@@ -307,6 +385,9 @@
             initCodeMirror6(currentCode);
             if (ext === 'md' || ext === 'markdown') {
                 viewToggles.classList.remove('d-none');
+            } else {
+                document.getElementById('btn-easymde').classList.add('d-none');
+                document.querySelector('label[for="btn-easymde"]').classList.add('d-none');
             }
         }
 
@@ -381,12 +462,10 @@
                 status: false,
             });
             
-            // 💡 關鍵：啟動行數顯示與套用官方 Darcula 主題
             const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
             easyMdeInstance.codemirror.setOption("lineNumbers", true);
             easyMdeInstance.codemirror.setOption("theme", isDark ? "darcula" : "default");
 
-            // 🌟 新增：如果副檔名是 yml/yaml，強制把底層的語法模式切換為 yaml
             if (ext === 'yml' || ext === 'yaml') {
                 easyMdeInstance.codemirror.setOption("mode", "yaml");
             }
@@ -398,7 +477,7 @@
         }
 
         // ==========================================
-        // 🌟 三引擎無縫切換邏輯 (解決切換後空白的 Bug)
+        // 🌟 三引擎無縫切換邏輯
         // ==========================================
         window.switchEngine = function(targetEngine) {
             if (currentEngine === targetEngine) return;
@@ -416,13 +495,13 @@
                 if (!cm6View) initCodeMirror6(currentCode);
                 else {
                     setCM6Value(currentCode);
-                    cm6View.requestMeasure(); // 💡 強迫 CM6 在取消隱藏時重新計算版面
+                    cm6View.requestMeasure(); 
                 }
             } else if (targetEngine === 'monaco') {
                 if (!monacoInstance) initMonaco(currentCode);
                 else {
                     monacoInstance.setValue(currentCode);
-                    monacoInstance.layout(); // 💡 強迫 Monaco 在取消隱藏時重新計算版面
+                    monacoInstance.layout(); 
                 }
             } else if (targetEngine === 'easymde') {
                 if (!easyMdeInstance) initEasyMDE(currentCode);
