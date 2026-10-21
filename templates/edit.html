@@ -598,6 +598,97 @@
             let body = document.getElementById('commit_body').value.trim();
             document.getElementById('real_message').value = body ? (title + "\n\n" + body) : title;
         };
+		
+		document.addEventListener('paste', async function(e) {
+			const items = (e.clipboardData || e.originalEvent.clipboardData).items;
+			let imageItem = null;
+
+			for (let i = 0; i < items.length; i++) {
+				if (items[i].type.indexOf('image') !== -1) {
+					imageItem = items[i];
+					break;
+				}
+			}
+
+			if (!imageItem) return;
+
+			e.preventDefault();
+			const blob = imageItem.getAsFile();
+			const formData = new FormData();
+			formData.append("image", blob, `paste_${Date.now()}.png`);
+
+			const placeholderText = "![圖片上傳中...]()";
+
+			// --- 根據當前啟用的引擎插入佔位符號 ---
+			let cm6Pos = null;
+			let monacoPos = null;
+
+			if (currentEngine === 'codemirror' && cm6View) {
+				cm6Pos = cm6View.state.selection.main.head;
+				cm6View.dispatch({
+					changes: { from: cm6Pos, insert: placeholderText },
+					selection: { anchor: cm6Pos + placeholderText.length }
+				});
+			} else if (currentEngine === 'monaco' && monacoInstance) {
+				monacoPos = monacoInstance.getPosition();
+				monacoInstance.executeEdits("paste-image", [{
+					range: new monaco.Range(monacoPos.lineNumber, monacoPos.column, monacoPos.lineNumber, monacoPos.column),
+					text: placeholderText,
+					forceMoveMarkers: true
+				}]);
+			} else if (currentEngine === 'easymde' && easyMdeInstance) {
+				easyMdeInstance.codemirror.replaceSelection(placeholderText);
+			}
+
+			// --- 非同步上傳圖片 ---
+			try {
+				const response = await fetch(`/repo/${repoName}/upload_paste_image`, {
+					method: 'POST',
+					body: formData
+				});
+				const data = await response.json();
+
+				if (response.ok && data.markdown) {
+					replacePlaceholder(placeholderText, data.markdown);
+				} else {
+					alert("❌ 圖片上傳失敗: " + (data.error || "未知錯誤"));
+					replacePlaceholder(placeholderText, "");
+				}
+			} catch (err) {
+				alert("❌ 網路連線錯誤: " + err);
+				replacePlaceholder(placeholderText, "");
+			}
+		});
+
+		// 統一替換佔位符號邏輯
+		function replacePlaceholder(oldText, newText) {
+			if (currentEngine === 'codemirror' && cm6View) {
+				const currentDoc = cm6View.state.doc.toString();
+				const idx = currentDoc.indexOf(oldText);
+				if (idx !== -1) {
+					cm6View.dispatch({
+						changes: { from: idx, to: idx + oldText.length, insert: newText }
+					});
+				}
+			} else if (currentEngine === 'monaco' && monacoInstance) {
+				const model = monacoInstance.getModel();
+				const currentVal = model.getValue();
+				const idx = currentVal.indexOf(oldText);
+				if (idx !== -1) {
+					const startPos = model.getPositionAt(idx);
+					const endPos = model.getPositionAt(idx + oldText.length);
+					monacoInstance.executeEdits("replace-image", [{
+						range: new monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column),
+						text: newText,
+						forceMoveMarkers: true
+					}]);
+				}
+			} else if (currentEngine === 'easymde' && easyMdeInstance) {
+				const cm = easyMdeInstance.codemirror;
+				const currentVal = cm.getValue();
+				cm.setValue(currentVal.replace(oldText, newText));
+			}
+		}
     </script>
 </body>
 </html>

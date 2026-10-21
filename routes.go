@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -464,6 +465,51 @@ func registerWebUI(r *gin.Engine) {
 			}
 			c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s_full_backup.zip", repoName))
 			c.Data(http.StatusOK, "application/zip", zipBytes)
+		})
+		
+		// 🌟 新增：剪貼簿直接貼上圖片 API
+		repo.POST("/upload_paste_image", func(c *gin.Context) {
+			repoName := c.Param("repo_name")
+			fileHeader, err := c.FormFile("image")
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "未收到圖片檔案"})
+				return
+			}
+
+			file, err := fileHeader.Open()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "無法讀取圖片"})
+				return
+			}
+			defer file.Close()
+
+			imgBytes, err := io.ReadAll(file)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "讀取圖片資料失敗"})
+				return
+			}
+
+			// 自動命名並歸類存入 assets/images/ 資料夾
+			timestamp := time.Now().Format("20060102_150405")
+			ext := filepath.Ext(fileHeader.Filename)
+			if ext == "" { ext = ".png" }
+			relPath := fmt.Sprintf("assets/images/%s%s", timestamp, ext)
+
+			uploadFiles := []UploadFile{
+				{Path: relPath, Bytes: imgBytes},
+			}
+			commitMsg := fmt.Sprintf("🖼️ 上傳貼圖: %s", filepath.Base(relPath))
+
+			// 利用專案已有的 BatchUploadAndCommit 寫入磁碟並提交至 Git
+			if err := BatchUploadAndCommit(repoName, uploadFiles, commitMsg); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "圖片提交失敗: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"path":     relPath,
+				"markdown": fmt.Sprintf("![image](%s)", relPath),
+			})
 		})
 	}
 
