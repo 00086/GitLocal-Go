@@ -57,7 +57,7 @@
         .cm-editor, .monaco-pane-wrapper { flex: 1; height: 100%; outline: none; }
         .cm-scroller { overflow: auto !important; font-family: 'Consolas', 'Courier New', monospace !important; }
         
-        #preview-pane { flex: 1; min-height: 0; height: 100%; overflow-y: auto !important; border: 1px solid var(--bs-border-color); border-radius: 6px; padding: 30px; background-color: var(--bs-body-bg); color: var(--bs-body-color); }
+        #preview-pane { flex: 1; min-height: 0; height: 100%; overflow-y: auto !important; border: 1px solid var(--bs-border-color); border-radius: 6px; padding: 30px; background-color: var(--bs-body-bg); color: var(--bs-body-color); position: relative;}
         .image-preview { max-width: 100%; max-height: 550px; border-radius: 6px; }
         .bg-checkered { background-image: linear-gradient(45deg, #f0f0f0 25%, transparent 25%), linear-gradient(-45deg, #f0f0f0 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #f0f0f0 75%), linear-gradient(-45deg, transparent 75%, #f0f0f0 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px; }
         [data-bs-theme="dark"] .bg-checkered { background-image: linear-gradient(45deg, #333 25%, transparent 25%), linear-gradient(-45deg, #333 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #333 75%), linear-gradient(-45deg, transparent 75%, #333 75%); }
@@ -84,6 +84,26 @@
         [data-bs-theme="dark"] #wrapper-easymde .CodeMirror { background: #1e1e1e !important; }
         [data-bs-theme="dark"] #wrapper-easymde .CodeMirror-gutters { background-color: #1e1e1e !important; border-right: 1px solid #333 !important; }
         [data-bs-theme="dark"] #wrapper-easymde .CodeMirror-linenumber { color: #858585 !important; }
+
+        /* 🌟 Markdown 程式碼方框 (三個反引號) 複製按鈕 */
+        .code-block-wrapper { position: relative; margin-bottom: 1rem; }
+        .code-block-wrapper pre { margin-bottom: 0 !important; }
+        .code-copy-btn {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            z-index: 5;
+            padding: 2px 8px;
+            font-size: 0.75rem;
+            line-height: 1.4;
+            border-radius: 4px;
+            opacity: 0.65;
+            transition: opacity 0.2s ease, background-color 0.2s ease;
+            background-color: var(--bs-body-bg);
+            border: 1px solid var(--bs-border-color);
+            color: var(--bs-body-color);
+        }
+        .code-block-wrapper:hover .code-copy-btn { opacity: 1; }
     </style>
 </head>
 <body class="container-fluid">
@@ -588,7 +608,9 @@
                 engineToggles.classList.add('d-none');
                 previewContainer.classList.remove('d-none');
                 actionBar.classList.add('d-none');
-                document.getElementById('preview-pane').innerHTML = marked.parse(markdownText);
+                const previewPane = document.getElementById('preview-pane');
+                previewPane.innerHTML = marked.parse(markdownText);
+                addCodeCopyButtons(previewPane); // 🌟 預覽畫面即時掛載複製按鈕
             }
         };
         
@@ -598,97 +620,168 @@
             let body = document.getElementById('commit_body').value.trim();
             document.getElementById('real_message').value = body ? (title + "\n\n" + body) : title;
         };
-		
-		document.addEventListener('paste', async function(e) {
-			const items = (e.clipboardData || e.originalEvent.clipboardData).items;
-			let imageItem = null;
 
-			for (let i = 0; i < items.length; i++) {
-				if (items[i].type.indexOf('image') !== -1) {
-					imageItem = items[i];
-					break;
-				}
-			}
+        // 🌟 處理 Markdown 中的程式碼方框複製按鈕
+        function addCodeCopyButtons(container) {
+            if (!container) return;
+            const preElements = container.querySelectorAll('pre');
+            preElements.forEach(pre => {
+                if (pre.dataset.hasCopyButton || pre.closest('.code-block-wrapper')) return;
+                pre.dataset.hasCopyButton = "true";
 
-			if (!imageItem) return;
+                const wrapper = document.createElement('div');
+                wrapper.className = 'code-block-wrapper';
 
-			e.preventDefault();
-			const blob = imageItem.getAsFile();
-			const formData = new FormData();
-			formData.append("image", blob, `paste_${Date.now()}.png`);
+                pre.parentNode.insertBefore(wrapper, pre);
+                wrapper.appendChild(pre);
 
-			const placeholderText = "![圖片上傳中...]()";
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'btn btn-sm code-copy-btn shadow-sm';
+                btn.innerHTML = '📋 複製';
+                btn.title = '複製程式碼';
 
-			// --- 根據當前啟用的引擎插入佔位符號 ---
-			let cm6Pos = null;
-			let monacoPos = null;
+                btn.addEventListener('click', async () => {
+                    const codeEl = pre.querySelector('code') || pre;
+                    const codeText = codeEl.innerText.replace(/\n$/, '');
 
-			if (currentEngine === 'codemirror' && cm6View) {
-				cm6Pos = cm6View.state.selection.main.head;
-				cm6View.dispatch({
-					changes: { from: cm6Pos, insert: placeholderText },
-					selection: { anchor: cm6Pos + placeholderText.length }
-				});
-			} else if (currentEngine === 'monaco' && monacoInstance) {
-				monacoPos = monacoInstance.getPosition();
-				monacoInstance.executeEdits("paste-image", [{
-					range: new monaco.Range(monacoPos.lineNumber, monacoPos.column, monacoPos.lineNumber, monacoPos.column),
-					text: placeholderText,
-					forceMoveMarkers: true
-				}]);
-			} else if (currentEngine === 'easymde' && easyMdeInstance) {
-				easyMdeInstance.codemirror.replaceSelection(placeholderText);
-			}
+                    try {
+                        await copyTextToClipboard(codeText);
+                        btn.innerHTML = '✅ 已複製';
+                        btn.classList.add('text-success', 'border-success');
+                        setTimeout(() => {
+                            btn.innerHTML = '📋 複製';
+                            btn.classList.remove('text-success', 'border-success');
+                        }, 2000);
+                    } catch (err) {
+                        btn.innerHTML = '❌ 失敗';
+                        setTimeout(() => {
+                            btn.innerHTML = '📋 複製';
+                        }, 2000);
+                    }
+                });
 
-			// --- 非同步上傳圖片 ---
-			try {
-				const response = await fetch(`/repo/${repoName}/upload_paste_image`, {
-					method: 'POST',
-					body: formData
-				});
-				const data = await response.json();
+                wrapper.appendChild(btn);
+            });
+        }
 
-				if (response.ok && data.markdown) {
-					replacePlaceholder(placeholderText, data.markdown);
-				} else {
-					alert("❌ 圖片上傳失敗: " + (data.error || "未知錯誤"));
-					replacePlaceholder(placeholderText, "");
-				}
-			} catch (err) {
-				alert("❌ 網路連線錯誤: " + err);
-				replacePlaceholder(placeholderText, "");
-			}
-		});
+        // 🌟 雙軌剪貼簿相容邏輯 (相容 HTTP 環境)
+        function copyTextToClipboard(text) {
+            if (navigator.clipboard && window.isSecureContext) {
+                return navigator.clipboard.writeText(text);
+            }
+            return new Promise((resolve, reject) => {
+                const textArea = document.createElement("textarea");
+                textArea.value = text;
+                textArea.style.position = "fixed";
+                textArea.style.left = "-999999px";
+                textArea.style.top = "-999999px";
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    const successful = document.execCommand('copy');
+                    document.body.removeChild(textArea);
+                    if (successful) resolve();
+                    else reject(new Error('複製失敗'));
+                } catch (err) {
+                    document.body.removeChild(textArea);
+                    reject(err);
+                }
+            });
+        }
 
-		// 統一替換佔位符號邏輯
-		function replacePlaceholder(oldText, newText) {
-			if (currentEngine === 'codemirror' && cm6View) {
-				const currentDoc = cm6View.state.doc.toString();
-				const idx = currentDoc.indexOf(oldText);
-				if (idx !== -1) {
-					cm6View.dispatch({
-						changes: { from: idx, to: idx + oldText.length, insert: newText }
-					});
-				}
-			} else if (currentEngine === 'monaco' && monacoInstance) {
-				const model = monacoInstance.getModel();
-				const currentVal = model.getValue();
-				const idx = currentVal.indexOf(oldText);
-				if (idx !== -1) {
-					const startPos = model.getPositionAt(idx);
-					const endPos = model.getPositionAt(idx + oldText.length);
-					monacoInstance.executeEdits("replace-image", [{
-						range: new monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column),
-						text: newText,
-						forceMoveMarkers: true
-					}]);
-				}
-			} else if (currentEngine === 'easymde' && easyMdeInstance) {
-				const cm = easyMdeInstance.codemirror;
-				const currentVal = cm.getValue();
-				cm.setValue(currentVal.replace(oldText, newText));
-			}
-		}
+        // 🌟 全域攔截圖片貼上事件
+        document.addEventListener('paste', async function(e) {
+            const items = (e.clipboardData || e.originalEvent.clipboardData).items;
+            let imageItem = null;
+
+            for (let i = 0; i < items.length; i++) {
+                if (items[i].type.indexOf('image') !== -1) {
+                    imageItem = items[i];
+                    break;
+                }
+            }
+
+            if (!imageItem) return;
+
+            e.preventDefault();
+            const blob = imageItem.getAsFile();
+            const formData = new FormData();
+            formData.append("image", blob, `paste_${Date.now()}.png`);
+
+            const placeholderText = "![圖片上傳中...]()";
+
+            // --- 根據當前啟用的引擎插入佔位符號 ---
+            let cm6Pos = null;
+            let monacoPos = null;
+
+            if (currentEngine === 'codemirror' && cm6View) {
+                cm6Pos = cm6View.state.selection.main.head;
+                cm6View.dispatch({
+                    changes: { from: cm6Pos, insert: placeholderText },
+                    selection: { anchor: cm6Pos + placeholderText.length }
+                });
+            } else if (currentEngine === 'monaco' && monacoInstance) {
+                monacoPos = monacoInstance.getPosition();
+                monacoInstance.executeEdits("paste-image", [{
+                    range: new monaco.Range(monacoPos.lineNumber, monacoPos.column, monacoPos.lineNumber, monacoPos.column),
+                    text: placeholderText,
+                    forceMoveMarkers: true
+                }]);
+            } else if (currentEngine === 'easymde' && easyMdeInstance) {
+                easyMdeInstance.codemirror.replaceSelection(placeholderText);
+            }
+
+            // --- 非同步上傳圖片 ---
+            try {
+                const response = await fetch(`/repo/${repoName}/upload_paste_image`, {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+
+                if (response.ok && data.markdown) {
+                    replacePlaceholder(placeholderText, data.markdown);
+                } else {
+                    alert("❌ 圖片上傳失敗: " + (data.error || "未知錯誤"));
+                    replacePlaceholder(placeholderText, "");
+                }
+            } catch (err) {
+                alert("❌ 網路連線錯誤: " + err);
+                replacePlaceholder(placeholderText, "");
+            }
+        });
+
+        // 統一替換佔位符號邏輯
+        function replacePlaceholder(oldText, newText) {
+            if (currentEngine === 'codemirror' && cm6View) {
+                const currentDoc = cm6View.state.doc.toString();
+                const idx = currentDoc.indexOf(oldText);
+                if (idx !== -1) {
+                    cm6View.dispatch({
+                        changes: { from: idx, to: idx + oldText.length, insert: newText }
+                    });
+                }
+            } else if (currentEngine === 'monaco' && monacoInstance) {
+                const model = monacoInstance.getModel();
+                const currentVal = model.getValue();
+                const idx = currentVal.indexOf(oldText);
+                if (idx !== -1) {
+                    const startPos = model.getPositionAt(idx);
+                    const endPos = model.getPositionAt(idx + oldText.length);
+                    monacoInstance.executeEdits("replace-image", [{
+                        range: new monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column),
+                        text: newText,
+                        forceMoveMarkers: true
+                    }]);
+                }
+            } else if (currentEngine === 'easymde' && easyMdeInstance) {
+                const cm = easyMdeInstance.codemirror;
+                const currentVal = cm.getValue();
+                cm.setValue(currentVal.replace(oldText, newText));
+            }
+        }
     </script>
 </body>
 </html>

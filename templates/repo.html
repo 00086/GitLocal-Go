@@ -102,6 +102,27 @@
         }
         .EasyMDEContainer .CodeMirror-scroll { min-height: 150px !important; height: 100% !important; overflow-y: auto !important; }
         .EasyMDEContainer .editor-statusbar { display: none !important; }
+		
+		/* 🌟 Markdown 程式碼方框 (三個反引號) 複製按鈕 */
+        .code-block-wrapper { position: relative; margin-bottom: 1rem; }
+        .code-block-wrapper pre { margin-bottom: 0 !important; }
+        .code-copy-btn {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            z-index: 5;
+            padding: 2px 8px;
+            font-size: 0.75rem;
+            line-height: 1.4;
+            border-radius: 4px;
+            opacity: 0.65;
+            transition: opacity 0.2s ease, background-color 0.2s ease;
+            background-color: var(--bs-body-bg);
+            border: 1px solid var(--bs-border-color);
+            color: var(--bs-body-color);
+        }
+        .code-block-wrapper:hover .code-copy-btn { opacity: 1; }
+		
     </style>
 </head>
 
@@ -1070,6 +1091,7 @@
 				.then(response => response.text())
 				.then(text => {
 					readmeContent.innerHTML = marked.parse(text);
+					addCodeCopyButtons(readmeContent); // 🌟 核心新增：載入 Markdown 後自動生成複製按鈕
 				})
 				.catch(err => {
 					readmeContent.innerHTML = `<span class="text-danger">無法載入 README 內容</span>`;
@@ -1596,6 +1618,7 @@
 		
 		const badges = container.querySelectorAll('.latest-badge');
 		for(let i = 1; i < badges.length; i++) badges[i].style.display = 'none';
+		addCodeCopyButtons(container); // 🌟 讓 Releases 的代碼方框也支援複製
 	}
 
 	let createReleaseEditor = null;
@@ -2265,6 +2288,78 @@
 				alert(`❌ 系統連線錯誤: ${e}`);
 			}
 		}
+	}
+	
+	// 🌟 為 Markdown 程式碼方框 (<pre>) 自動掛載 GitHub 風格複製按鈕
+	function addCodeCopyButtons(container) {
+		if (!container) return;
+		const preElements = container.querySelectorAll('pre');
+		preElements.forEach(pre => {
+			if (pre.dataset.hasCopyButton || pre.closest('.code-block-wrapper')) return;
+			pre.dataset.hasCopyButton = "true";
+
+			// 建立外層容器，避免橫向捲動時按鈕跟著跑掉
+			const wrapper = document.createElement('div');
+			wrapper.className = 'code-block-wrapper';
+
+			pre.parentNode.insertBefore(wrapper, pre);
+			wrapper.appendChild(pre);
+
+			// 建立按鈕
+			const btn = document.createElement('button');
+			btn.type = 'button';
+			btn.className = 'btn btn-sm code-copy-btn shadow-sm';
+			btn.innerHTML = '📋 複製';
+			btn.title = '複製程式碼';
+
+			btn.addEventListener('click', async () => {
+				const codeEl = pre.querySelector('code') || pre;
+				const codeText = codeEl.innerText.replace(/\n$/, '');
+
+				try {
+					await copyTextToClipboard(codeText);
+					btn.innerHTML = '✅ 已複製';
+					btn.classList.add('text-success', 'border-success');
+					setTimeout(() => {
+						btn.innerHTML = '📋 複製';
+						btn.classList.remove('text-success', 'border-success');
+					}, 2000);
+				} catch (err) {
+					btn.innerHTML = '❌ 失敗';
+					setTimeout(() => {
+						btn.innerHTML = '📋 複製';
+					}, 2000);
+				}
+			});
+
+			wrapper.appendChild(btn);
+		});
+	}
+
+	// 支援 Localhost 與區網 HTTP (非 HTTPS) 的雙重剪貼簿複製
+	function copyTextToClipboard(text) {
+		if (navigator.clipboard && window.isSecureContext) {
+			return navigator.clipboard.writeText(text);
+		}
+		return new Promise((resolve, reject) => {
+			const textArea = document.createElement("textarea");
+			textArea.value = text;
+			textArea.style.position = "fixed";
+			textArea.style.left = "-999999px";
+			textArea.style.top = "-999999px";
+			document.body.appendChild(textArea);
+			textArea.focus();
+			textArea.select();
+			try {
+				const successful = document.execCommand('copy');
+				document.body.removeChild(textArea);
+				if (successful) resolve();
+				else reject(new Error('複製失敗'));
+			} catch (err) {
+				document.body.removeChild(textArea);
+				reject(err);
+			}
+		});
 	}
 
 </script>
